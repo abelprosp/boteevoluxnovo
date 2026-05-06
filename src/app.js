@@ -1,5 +1,6 @@
 require("dotenv").config();
 const express = require("express");
+const { pathToFileURL } = require("url");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
@@ -406,6 +407,68 @@ async function classifyIntent(payload, ctx) {
 /** Limite de caracteres enviados ao modelo (evita estourar contexto). */
 const MAX_RESUME_TEXT_FOR_LLM = 85000;
 
+/** Se pdf-parse já extraiu texto “suficiente”, não abre pdfjs (mais pesado). */
+const PDF_PARSE_ENOUGH_CHARS = 80;
+
+/**
+ * Segundo método de extração (PDFs do WhatsApp / fontes que o pdf-parse ignora).
+ */
+async function extractPdfTextWithPdfJs(buffer) {
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  if (pdfjs.GlobalWorkerOptions) {
+    pdfjs.GlobalWorkerOptions.workerSrc = pathToFileURL(
+      require.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs")
+    ).href;
+  }
+  const data = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+  const loadingTask = pdfjs.getDocument({
+    data,
+    useSystemFonts: true,
+    disableFontFace: true,
+    isEvalSupported: false,
+    useWorkerFetch: false,
+    disableRange: true,
+    disableStream: true,
+  });
+  const doc = await loadingTask.promise;
+  let full = "";
+  const maxPages = Math.min(Number(doc.numPages) || 0, 40);
+  for (let p = 1; p <= maxPages; p++) {
+    const page = await doc.getPage(p);
+    const tc = await page.getTextContent();
+    for (const item of tc.items) {
+      if (item && typeof item.str === "string" && item.str) {
+        full += item.str;
+      }
+      if (item && item.hasEOL) full += " ";
+    }
+    full += "\n";
+  }
+  return full.replace(/\s+/g, " ").trim();
+}
+
+/** pdf-parse + fallback pdfjs; escolhe o resultado com mais texto. */
+async function extractPdfTextBest(buffer) {
+  let fromParse = "";
+  try {
+    const pdfParse = require("pdf-parse");
+    const data = await pdfParse(buffer);
+    fromParse = (data.text || "").replace(/\s+/g, " ").trim();
+  } catch (_e) {
+    /* mantém vazio */
+  }
+  if (fromParse.length >= PDF_PARSE_ENOUGH_CHARS) return fromParse;
+
+  let fromPdfJs = "";
+  try {
+    fromPdfJs = await extractPdfTextWithPdfJs(buffer);
+  } catch (_e) {
+    /* worker/canvas ou PDF estranho */
+  }
+
+  return fromPdfJs.length > fromParse.length ? fromPdfJs.trim() : fromParse;
+}
+
 async function plainTextFromResumeMedia(payload) {
   if (!payload.mediaBase64) return { text: null, error: "sem_base64" };
   const buffer = decodeBase64ToBuffer(payload.mediaBase64);
@@ -425,12 +488,6 @@ async function plainTextFromResumeMedia(payload) {
   /** Texto mínimo (currículos com poucas linhas ou PDF com pouco texto legível). */
   const minLen = 8;
 
-  const tryPdf = async () => {
-    const pdfParse = require("pdf-parse");
-    const data = await pdfParse(buffer);
-    return (data.text || "").replace(/\s+/g, " ").trim();
-  };
-
   const tryDocx = async () => {
     const mammoth = require("mammoth");
     const r = await mammoth.extractRawText({ buffer });
@@ -443,7 +500,7 @@ async function plainTextFromResumeMedia(payload) {
 
   try {
     if (isPdfMagic) {
-      const t = await tryPdf();
+      const t = await extractPdfTextBest(buffer);
       if (t.length >= minLen) return { text: t, error: null };
       return { text: null, error: "pdf_sem_texto" };
     }
@@ -456,7 +513,7 @@ async function plainTextFromResumeMedia(payload) {
       }
     }
     if (mt.includes("pdf") || name.endsWith(".pdf")) {
-      const t = await tryPdf();
+      const t = await extractPdfTextBest(buffer);
       if (t.length >= minLen) return { text: t, error: null };
     }
     if (
@@ -476,7 +533,7 @@ async function plainTextFromResumeMedia(payload) {
   }
 
   try {
-    const t = await tryPdf();
+    const t = await extractPdfTextBest(buffer);
     if (t.length >= minLen) return { text: t, error: null };
   } catch (_e) {}
 
