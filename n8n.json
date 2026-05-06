@@ -1,5 +1,5 @@
 {
-  "name": "Evolux - Webhook -> API IA -> MyChat",
+  "name": "Evolux RH - Webhook -> API Conversa -> MyChat",
   "nodes": [
     {
       "parameters": {
@@ -7,22 +7,22 @@
         "path": "webhook-evolux",
         "options": {}
       },
-      "id": "4eb7ad2e-2d91-4d62-9b83-c0f7853b824d",
+      "id": "webhook-01",
       "name": "Webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
-      "position": [-1160, 260],
+      "position": [-960, 260],
       "webhookId": "evolux-webhook-chat"
     },
     {
       "parameters": {
-        "functionCode": "const body = $json.body || {};\nconst content = body.content || {};\nconst contact = body.contact || {};\n\nconst rawMessage = content.text || content.body || body.message || body.chatInput || '';\nlet phone = String(contact.number || body.phone || '').replace(/\\D/g, '');\nif (!phone) return [{ json: { ignore: true } }];\nif (!phone.startsWith('55')) phone = '55' + phone;\n\nconst chatInput = String(rawMessage || '').trim();\nif (!chatInput) return [{ json: { ignore: true } }];\n\nreturn [{ json: { ignore: false, phone, sessionId: phone, chatInput, history: [] } }];"
+        "functionCode": "const body = $json.body || {};\nconst content = body.content || body.message || body.data?.content || {};\nconst contact = body.contact || body.sender || {};\n\nconst doc = content.document || content.image || body.document || null;\n\nconst chatInput = String(content.text || content.body || content.caption || body.message || '').trim();\nlet phone = String(contact.number || contact.id?.user || body.phone || '').replace(/\\D/g, '');\nif (!phone) return [{ json: { ignore: true } }];\nif (!phone.startsWith('55')) phone = '55' + phone;\n\nconst mediaBase64 =\n  content.media ||\n  content.base64 ||\n  doc?.base64 ||\n  doc?.data ||\n  body.mediaBase64 ||\n  body.document?.base64 ||\n  null;\n\nconst mimetype = String(\n  content.mimetype || content.mimeType || doc?.mimetype || doc?.mime_type || body.mimetype || ''\n).toLowerCase();\n\nconst fileName =\n  content.fileName ||\n  content.filename ||\n  doc?.fileName ||\n  doc?.file_name ||\n  body.fileName ||\n  null;\n\nif (!chatInput && !mediaBase64 && !fileName && !mimetype) return [{ json: { ignore: true } }];\n\nreturn [{\n  json: {\n    ignore: false,\n    phone,\n    sessionId: phone,\n    chatInput,\n    mediaBase64,\n    mimetype,\n    fileName,\n    rawPayload: body,\n    history: []\n  }\n}];"
       },
-      "id": "76ed2fb0-7a43-4789-9d58-b16e3a9259bb",
+      "id": "normalize-01",
       "name": "Normalizar Entrada",
       "type": "n8n-nodes-base.function",
       "typeVersion": 1,
-      "position": [-920, 260]
+      "position": [-720, 260]
     },
     {
       "parameters": {
@@ -45,60 +45,11 @@
         },
         "options": {}
       },
-      "id": "68c368a8-26a4-4f9d-9d53-c4f13a9d9fd6",
+      "id": "filter-01",
       "name": "Filtrar Invalidas",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [-700, 260]
-    },
-    {
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": false,
-            "typeValidation": "strict"
-          },
-          "conditions": [
-            {
-              "leftValue": "={{ $json.chatInput }}",
-              "rightValue": "vaga",
-              "operator": {
-                "type": "string",
-                "operation": "contains"
-              }
-            }
-          ],
-          "combinator": "and"
-        },
-        "options": {}
-      },
-      "id": "f4c55af5-4d8e-4f0d-b6ff-3038f18fa635",
-      "name": "Tem Palavra Vaga?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2,
-      "position": [-460, 260]
-    },
-    {
-      "parameters": {
-        "method": "GET",
-        "url": "https://SEU-PROJETO.vercel.app/jobs?limit=10",
-        "options": {}
-      },
-      "id": "c1dbdd27-207e-4a01-a4fa-2748cae5f4d1",
-      "name": "Consultar Jobs API",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4,
-      "position": [-220, 140]
-    },
-    {
-      "parameters": {
-        "functionCode": "const jobsResp = $input.first().json || {};\nconst original = $('Tem Palavra Vaga?').first().json;\n\nconst jobs = Array.isArray(jobsResp.jobs) ? jobsResp.jobs : [];\nconst resumo = jobs.length\n  ? jobs.slice(0, 10).map((j, i) => `${i + 1}. ${j.title || j.job_title || 'Vaga sem titulo'}${j.location ? ' - ' + j.location : ''}`).join('\\n')\n  : 'Sem vagas listadas no momento.';\n\nconst enriched = `${original.chatInput}\\n\\n[CONTEXTO_JOBS]\\n${resumo}`;\n\nreturn [{\n  json: {\n    ...original,\n    history: [\n      {\n        role: 'system',\n        content: 'Use as vagas do bloco [CONTEXTO_JOBS] para responder de forma objetiva e convidar o candidato para o site evoluxrh.com.br.'\n      }\n    ],\n    chatInput: enriched\n  }\n}];"
-      },
-      "id": "ba92ec4c-f884-4ec6-a44c-e1ce3f5c39de",
-      "name": "Injetar Contexto Vagas",
-      "type": "n8n-nodes-base.function",
-      "typeVersion": 1,
-      "position": [20, 140]
+      "position": [-500, 260]
     },
     {
       "parameters": {
@@ -115,24 +66,24 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ chatInput: $json.chatInput, phone: $json.phone, sessionId: $json.sessionId, history: $json.history || [] }) }}",
+        "jsonBody": "={{ JSON.stringify({ phone: $json.phone, sessionId: $json.sessionId, chatInput: $json.chatInput, mediaBase64: $json.mediaBase64, mimetype: $json.mimetype, fileName: $json.fileName, rawPayload: $json.rawPayload, history: $json.history || [] }) }}",
         "options": {}
       },
-      "id": "cedaf33c-8c41-4a4d-b39b-b81de0b47f95",
-      "name": "Chamar API IA",
+      "id": "chat-api-01",
+      "name": "Chamar API Conversa",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4,
-      "position": [260, 260]
+      "position": [-260, 260]
     },
     {
       "parameters": {
-        "functionCode": "const item = $input.first().json;\nconst mychatPayload = item.mychatPayload || {};\nconst number = String(mychatPayload.number || item.phone || '').replace(/\\D/g, '');\nconst body = String(mychatPayload.body || item.message || '').replace(/[\\r\\n]+/g, ' ').trim();\nif (!number || !body) throw new Error('Resposta da API IA sem number/body');\n\nreturn [{ json: {\n  number,\n  body,\n  externalKey: mychatPayload.externalKey || `lead_${number}`,\n  isClosed: mychatPayload.isClosed === true\n} }];"
+        "functionCode": "const item = $input.first().json || {};\nconst p = item.mychatPayload || {};\nconst number = String(p.number || item.phone || '').replace(/\\D/g, '');\nconst msg = String(p.body || item.message || '').replace(/[\\r\\n]+/g, ' ').trim();\nif (!number || !msg) throw new Error('API nao retornou dados para MyChat');\n\nreturn [{ json: {\n  number,\n  body: msg,\n  externalKey: p.externalKey || `lead_${number}`,\n  isClosed: p.isClosed === true\n} }];"
       },
-      "id": "e8363d10-97f2-4836-a2c8-f6e5f6f2807d",
+      "id": "fmt-mychat-01",
       "name": "Formatar MyChat",
       "type": "n8n-nodes-base.function",
       "typeVersion": 1,
-      "position": [500, 260]
+      "position": [-20, 260]
     },
     {
       "parameters": {
@@ -156,54 +107,80 @@
         "jsonBody": "={{ JSON.stringify({ number: $json.number, body: $json.body, externalKey: $json.externalKey, isClosed: $json.isClosed }) }}",
         "options": {}
       },
-      "id": "45f10f67-6b94-4887-a572-7df29d4ff0ce",
+      "id": "send-mychat-01",
       "name": "Enviar MyChat",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4,
-      "position": [740, 260]
+      "position": [220, 260]
     }
   ],
   "pinData": {},
   "connections": {
     "Webhook": {
-      "main": [[{ "node": "Normalizar Entrada", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Normalizar Entrada",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Normalizar Entrada": {
-      "main": [[{ "node": "Filtrar Invalidas", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Filtrar Invalidas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Filtrar Invalidas": {
       "main": [
         [],
-        [{ "node": "Tem Palavra Vaga?", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Chamar API Conversa",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
-    "Tem Palavra Vaga?": {
+    "Chamar API Conversa": {
       "main": [
-        [{ "node": "Consultar Jobs API", "type": "main", "index": 0 }],
-        [{ "node": "Chamar API IA", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Formatar MyChat",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
-    },
-    "Consultar Jobs API": {
-      "main": [[{ "node": "Injetar Contexto Vagas", "type": "main", "index": 0 }]]
-    },
-    "Injetar Contexto Vagas": {
-      "main": [[{ "node": "Chamar API IA", "type": "main", "index": 0 }]]
-    },
-    "Chamar API IA": {
-      "main": [[{ "node": "Formatar MyChat", "type": "main", "index": 0 }]]
     },
     "Formatar MyChat": {
-      "main": [[{ "node": "Enviar MyChat", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Enviar MyChat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
   "active": false,
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "4ac8d681-af4f-4a9e-b630-f17d4fa7b218",
+  "versionId": "2f9cb50d-bc2c-4f2d-9bc9-f8654b57c7da",
   "meta": {
     "instanceId": "evolux-instance"
   },
-  "id": "EvoluxWebhookApiMychat",
+  "id": "EvoluxConversaUnificada",
   "tags": []
 }

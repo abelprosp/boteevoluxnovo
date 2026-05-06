@@ -12,6 +12,7 @@ const NVIDIA_MODEL = process.env.NVIDIA_MODEL || "moonshotai/kimi-k2.6";
 const DEFAULT_SYSTEM_PROMPT =
   process.env.AI_SYSTEM_PROMPT ||
   "Você é Luiza, assistente de RH da EvoluxRH. Seja educada, clara e objetiva.";
+const contextMemory = new Map();
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error(
@@ -49,17 +50,124 @@ function normalizeResumePayload(body) {
   return payload;
 }
 
+function isDocumentLikeInRaw(raw) {
+  if (!raw || typeof raw !== "object") return false;
+  const c = raw.content ?? raw.message ?? {};
+  const t = String(c.type || raw.type || "").toLowerCase();
+  if (t === "document" || t === "image") return true;
+  if (c.document || c.image || raw.document || raw.image) return true;
+  if (raw.messages?.[0]?.message?.documentMessage) return true;
+  return false;
+}
+
+function pickFileMetaFromObject(obj) {
+  if (!obj || typeof obj !== "object") return {};
+  const fileName = obj.fileName || obj.filename || obj.file_name || null;
+  const mimetype = String(
+    obj.mimetype || obj.mimeType || obj.mime_type || ""
+  ).toLowerCase();
+  const mediaBase64 =
+    obj.base64 || obj.media || obj.mediaBase64 || obj.data || null;
+  return { fileName, mimetype, mediaBase64 };
+}
+
+function enrichChatPayload(payload, body) {
+  const roots = [
+    body,
+    payload.rawPayload,
+    body?.body,
+    payload.rawPayload?.body,
+  ].filter((x) => x && typeof x === "object");
+
+  for (const root of roots) {
+    if (!payload.mediaBase64 && root.mediaBase64) {
+      payload.mediaBase64 = root.mediaBase64;
+    }
+    const c = root.content || root.message || {};
+    const doc = c.document || c.documentMessage || c.image || root.document;
+    if (doc && typeof doc === "object") {
+      const p = pickFileMetaFromObject(doc);
+      if (!payload.mediaBase64 && p.mediaBase64)
+        payload.mediaBase64 = p.mediaBase64;
+      if (!payload.fileName && p.fileName) payload.fileName = p.fileName;
+      if (!payload.mimetype && p.mimetype) payload.mimetype = p.mimetype;
+    }
+    const dm = root.messages?.[0]?.message?.documentMessage;
+    if (dm && typeof dm === "object") {
+      const p = pickFileMetaFromObject(dm);
+      if (!payload.fileName && p.fileName) payload.fileName = p.fileName;
+      if (!payload.mimetype && p.mimetype) payload.mimetype = p.mimetype;
+    }
+  }
+
+  if (!payload.mediaBase64) {
+    for (const root of roots) {
+      const found = deepFindBase64String(root);
+      if (found) {
+        payload.mediaBase64 = found;
+        break;
+      }
+    }
+  }
+
+  if (!payload.fileName && !payload.mimetype && isDocumentLikeInRaw(payload.rawPayload)) {
+    payload.mimetype = payload.mimetype || "application/pdf";
+  }
+}
+
 function normalizeChatPayload(body) {
-  const chatInput = String(body.chatInput ?? body.message ?? "").trim();
+  let chatInput = String(body.chatInput ?? body.message ?? "").trim();
   const sessionId = String(body.sessionId ?? body.phone ?? "default");
   const phone = String(body.phone ?? "").replace(/\D/g, "");
   const history = Array.isArray(body.history) ? body.history : [];
+  let mediaBase64 = body.mediaBase64 || null;
+  const mimetype = String(body.mimetype || "").toLowerCase();
+  const fileName = body.fileName || null;
+  const rawPayload = body.rawPayload || null;
 
-  if (!chatInput) {
-    throw new Error("Campo obrigatório ausente: chatInput/message");
+  const looseMeta =
+    rawPayload && typeof rawPayload === "object"
+      ? pickFileMetaFromObject(
+          rawPayload.content?.document ||
+            rawPayload.content?.image ||
+            rawPayload.document ||
+            {}
+        )
+      : {};
+
+  if (!mediaBase64 && looseMeta.mediaBase64) mediaBase64 = looseMeta.mediaBase64;
+
+  const hasSomething =
+    !!chatInput ||
+    !!mediaBase64 ||
+    !!String(fileName || "").trim() ||
+    !!String(mimetype || "").trim() ||
+    !!String(looseMeta.fileName || "").trim() ||
+    !!String(looseMeta.mimetype || "").trim() ||
+    !!rawPayload;
+
+  if (!hasSomething) {
+    throw new Error("Campo obrigatório ausente: chatInput/message ou anexo");
   }
 
-  return { chatInput, sessionId, phone, history };
+  const ti = chatInput.toLowerCase();
+  if (
+    (ti === "document" || ti === "image" || ti === "áudio" || ti === "audio") &&
+    (fileName || looseMeta.fileName || rawPayload)
+  ) {
+    chatInput = "";
+  }
+
+  return {
+    chatInput,
+    sessionId,
+    phone,
+    history,
+    mediaBase64,
+    mimetype: mimetype || String(looseMeta.mimetype || "").toLowerCase(),
+    fileName: fileName || looseMeta.fileName || null,
+    rawPayload,
+  };
 }
 
 async function askAI({ chatInput, history }) {
@@ -109,6 +217,157 @@ async function askAI({ chatInput, history }) {
   return data?.choices?.[0]?.message?.content?.trim() || "";
 }
 
+function deepFindBase64String(obj, depth = 0) {
+  if (depth > 12 || !obj || typeof obj !== "object") return null;
+  for (const k of Object.keys(obj)) {
+    const v = obj[k];
+    if (typeof v === "string" && v.length > 200) {
+      const s = v.replace(/\s/g, "");
+      if (/^[A-Za-z0-9+/]+=*$/.test(s.slice(0, 500)) && s.length > 300) return s;
+    }
+    if (typeof v === "object" && v !== null) {
+      const inner = deepFindBase64String(v, depth + 1);
+      if (inner) return inner;
+    }
+  }
+  return null;
+}
+
+function hasResumeHint(payload, text) {
+  const name = String(payload.fileName || "").toLowerCase();
+  const mt = String(payload.mimetype || "").toLowerCase();
+  const ti = String(text || "").toLowerCase().trim();
+  if (isDocumentLikeInRaw(payload.rawPayload)) return true;
+  if ((ti === "document" || ti === "image" || ti === "[anexo]") && payload.rawPayload)
+    return true;
+  return (
+    !!payload.mediaBase64 ||
+    name.endsWith(".pdf") ||
+    name.endsWith(".doc") ||
+    name.endsWith(".docx") ||
+    name.endsWith(".jpg") ||
+    name.endsWith(".jpeg") ||
+    name.endsWith(".png") ||
+    mt.includes("pdf") ||
+    mt.includes("word") ||
+    mt.includes("docx") ||
+    mt.includes("document") ||
+    mt.includes("officedocument") ||
+    mt.startsWith("image/")
+  );
+}
+
+function isYes(text) {
+  return /^(sim|s|confirmo|ok|correto|pode salvar|pode cadastrar|ta certo|tá certo)$/i.test(
+    String(text || "").trim()
+  );
+}
+
+async function loadContext(sessionId) {
+  const local = contextMemory.get(sessionId);
+  try {
+    const { data, error } = await supabase
+      .from("conversation_cache")
+      .select("state")
+      .eq("session_id", sessionId)
+      .maybeSingle();
+    if (!error && data?.state) return data.state;
+  } catch (_e) {}
+  return (
+    local || {
+      lastIntent: null,
+      pendingConfirmation: false,
+      pendingResume: null,
+      awaitingResume: false,
+      recentTurns: [],
+    }
+  );
+}
+
+async function saveContext(sessionId, state) {
+  contextMemory.set(sessionId, state);
+  try {
+    await supabase.from("conversation_cache").upsert(
+      {
+        session_id: sessionId,
+        state,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "session_id" }
+    );
+  } catch (_e) {}
+}
+
+async function classifyIntent(payload, ctx) {
+  const history = [
+    ...ctx.recentTurns.slice(-4),
+    ...payload.history.slice(-4),
+    {
+      role: "system",
+      content:
+        'Classifique a intenção e retorne APENAS JSON: {"intent":"candidate|company|jobs|general","reason":"..."}. Regras: se usuário quer se candidatar ou mandou currículo/anexo => candidate; empresa/recrutador => company; saber vagas => jobs; restante => general.',
+    },
+  ];
+  const content = await askAI({
+    chatInput: `Mensagem: ${payload.chatInput || "(sem texto)"}; fileName=${
+      payload.fileName || ""
+    }; mimetype=${payload.mimetype || ""}; hasResumeHint=${hasResumeHint(
+      payload,
+      payload.chatInput
+    )}`,
+    history,
+  });
+  try {
+    const match = content.match(/\{[\s\S]*\}/);
+    const parsed = JSON.parse(match ? match[0] : content);
+    const intent = String(parsed.intent || "").toLowerCase();
+    if (["candidate", "company", "jobs", "general"].includes(intent)) return intent;
+  } catch (_e) {}
+  return "general";
+}
+
+async function extractResumeData(payload) {
+  if (!payload.mediaBase64) return null;
+  const prompt =
+    "Extraia dados de currículo e retorne APENAS JSON válido: " +
+    '{"fullName":null,"email":null,"phone":null,"city":null,"jobInterest":null} ' +
+    `Arquivo: ${payload.fileName || "curriculo"}; mimetype: ${
+      payload.mimetype || "desconhecido"
+    }; base64: ${payload.mediaBase64}`;
+  const out = await askAI({
+    chatInput: prompt,
+    history: [
+      {
+        role: "system",
+        content: "Você é extrator de currículo. Responda apenas JSON.",
+      },
+    ],
+  });
+  const match = out.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  return JSON.parse(match[0]);
+}
+
+async function saveResumeFromContext(phone, payload, extracted) {
+  const resume = normalizeResumePayload({
+    fullName: extracted?.fullName ?? null,
+    email: extracted?.email ?? null,
+    phone: phone,
+    city: extracted?.city ?? null,
+    jobInterest: extracted?.jobInterest ?? null,
+    fileName: payload.fileName ?? null,
+    fileSize: null,
+    mimetype: payload.mimetype ?? null,
+  });
+  const { data, error } = await supabase
+    .from("resumes")
+    .insert(resume)
+    .select("*")
+    .single();
+  if (error) throw new Error(error.message);
+  return data;
+}
+
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
@@ -116,19 +375,82 @@ app.get("/health", (_req, res) => {
 app.post("/webhook/chat", async (req, res) => {
   try {
     const payload = normalizeChatPayload(req.body);
-    const aiMessage = await askAI(payload);
+    enrichChatPayload(payload, req.body);
+    const ctx = await loadContext(payload.sessionId);
+    const text = String(payload.chatInput || "").trim();
+    const resumeHint = hasResumeHint(payload, text);
 
-    if (!aiMessage) {
-      return res.status(502).json({
-        ok: false,
-        error: "IA retornou resposta vazia",
+    // 1) Primeiro conversa/entende intenção (triagem com contexto)
+    let intent = await classifyIntent(payload, ctx);
+    if (resumeHint) intent = "candidate";
+    if (/candidatar|curricul|currículo/i.test(text)) intent = "candidate";
+
+    let aiMessage = "";
+
+    // 2) Se já está pendente de confirmação e usuário confirmou, salva
+    if (ctx.pendingConfirmation && isYes(text) && ctx.pendingResume) {
+      await saveResumeFromContext(payload.phone || payload.sessionId, payload, ctx.pendingResume);
+      ctx.pendingConfirmation = false;
+      ctx.pendingResume = null;
+      ctx.lastIntent = "candidate";
+      aiMessage = "Perfeito! Candidatura registrada com sucesso. Obrigado.";
+    } else if (intent === "company") {
+      ctx.lastIntent = "company";
+      aiMessage =
+        "Obrigado pelo contato. Recebemos sua mensagem como empresa e nossa equipe de RH vai analisar e retornar em breve. Se quiser conhecer vagas abertas, acesse: https://evoluxrh.com.br";
+    } else if (intent === "jobs") {
+      ctx.lastIntent = "jobs";
+      aiMessage =
+        "Temos vagas sim. Veja todas as oportunidades atualizadas em https://evoluxrh.com.br";
+    } else if (intent === "candidate") {
+      ctx.lastIntent = "candidate";
+      if (resumeHint) {
+        ctx.awaitingResume = false;
+        if (!payload.mediaBase64) {
+          aiMessage =
+            "Recebi o arquivo, mas sem o conteúdo para leitura. Reenvie o currículo como PDF/imagem/DOCX com o arquivo anexado corretamente para eu extrair os dados.";
+        } else {
+          const extracted = await extractResumeData(payload);
+          if (!extracted) {
+            aiMessage =
+              "Não consegui extrair os dados do currículo. Pode reenviar o arquivo, por favor?";
+          } else {
+            ctx.pendingResume = extracted;
+            ctx.pendingConfirmation = true;
+            aiMessage =
+              `Encontrei estes dados no currículo:\n` +
+              `Nome: ${extracted.fullName || "Não encontrado"}\n` +
+              `Email: ${extracted.email || "Não encontrado"}\n` +
+              `Telefone: ${extracted.phone || payload.phone || "Não encontrado"}\n` +
+              `Cidade: ${extracted.city || "Não encontrado"}\n` +
+              `Cargo de interesse: ${extracted.jobInterest || "Não encontrado"}\n\n` +
+              `Se estiver tudo certo, responda SIM para eu salvar.`;
+          }
+        }
+      } else {
+        ctx.awaitingResume = true;
+        aiMessage =
+          "Perfeito! Para se candidatar, envie seu currículo em PDF, imagem ou DOCX para eu extrair os dados e confirmar com você.";
+      }
+    } else {
+      aiMessage = await askAI({
+        chatInput: text || "Olá",
+        history: ctx.recentTurns.slice(-6),
       });
     }
+
+    ctx.recentTurns = [
+      ...ctx.recentTurns.slice(-10),
+      { role: "user", content: text || "[anexo]" },
+      { role: "assistant", content: aiMessage },
+    ];
+    await saveContext(payload.sessionId, ctx);
 
     return res.json({
       ok: true,
       sessionId: payload.sessionId,
       phone: payload.phone || null,
+      intent,
       message: aiMessage,
       mychatPayload: {
         number: payload.phone || payload.sessionId,
@@ -140,7 +462,7 @@ app.post("/webhook/chat", async (req, res) => {
   } catch (err) {
     return res.status(400).json({
       ok: false,
-      error: "Falha ao processar mensagem com IA",
+      error: "Falha ao processar mensagem",
       details: err.message,
     });
   }
