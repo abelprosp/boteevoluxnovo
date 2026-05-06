@@ -8,8 +8,8 @@ app.use(express.json({ limit: "15mb" }));
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY;
-const NVIDIA_MODEL = process.env.NVIDIA_MODEL || "moonshotai/kimi-k2.6";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const DEFAULT_SYSTEM_PROMPT =
   process.env.AI_SYSTEM_PROMPT ||
   "Você é Luiza, assistente de RH da EvoluxRH. Seja educada, clara e objetiva.";
@@ -242,12 +242,11 @@ async function askAI({
   chatInput,
   history,
   prependLuizaSystem = true,
-  thinking = true,
   max_tokens: maxTokens,
   temperature = 1,
 }) {
-  if (!NVIDIA_API_KEY) {
-    throw new Error("Defina NVIDIA_API_KEY no ambiente.");
+  if (!OPENAI_API_KEY) {
+    throw new Error("Defina OPENAI_API_KEY no ambiente.");
   }
 
   const messages = [];
@@ -264,32 +263,43 @@ async function askAI({
 
   messages.push({ role: "user", content: chatInput });
 
-  const response = await fetch(
-    "https://integrate.api.nvidia.com/v1/chat/completions",
-    {
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${NVIDIA_API_KEY}`,
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
       "Content-Type": "application/json",
       Accept: "application/json",
     },
     body: JSON.stringify({
-      model: NVIDIA_MODEL,
-      max_tokens: maxTokens != null ? maxTokens : 16384,
+      model: OPENAI_MODEL,
+      max_tokens: maxTokens != null ? maxTokens : 4096,
       temperature,
-      top_p: 1,
       stream: false,
-      ...(thinking ? { chat_template_kwargs: { thinking: true } } : {}),
       messages,
     }),
-  }
-  );
+  });
 
-  const data = await response.json();
+  let data;
+  try {
+    data = await response.json();
+  } catch (_e) {
+    data = {};
+  }
 
   if (!response.ok) {
-    const detail = data?.error?.message || "Erro ao consultar IA da NVIDIA";
-    throw new Error(detail);
+    const errPart =
+      (typeof data?.error === "object" && data.error !== null
+        ? data.error.message ||
+          data.error.code ||
+          JSON.stringify(data.error)
+        : null) ||
+      (typeof data?.error === "string" ? data.error : null) ||
+      data?.message ||
+      "";
+    const detail = String(errPart || `HTTP ${response.status}`).trim();
+    throw new Error(
+      detail ? `OpenAI: ${detail}` : "Erro ao consultar a API da OpenAI"
+    );
   }
 
   return data?.choices?.[0]?.message?.content?.trim() || "";
@@ -394,6 +404,8 @@ async function classifyIntent(payload, ctx) {
       payload.chatInput
     )}`,
     history,
+    max_tokens: 256,
+    temperature: 0.2,
   });
   try {
     const match = content.match(/\{[\s\S]*\}/);
@@ -574,7 +586,6 @@ async function extractResumeData(payload) {
       },
     ],
     prependLuizaSystem: false,
-    thinking: false,
     max_tokens: 2048,
     temperature: 0.2,
   });
@@ -615,20 +626,48 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
+function unwrapIncomingBody(reqBody) {
+  const b = reqBody;
+  if (!b || typeof b !== "object") return b;
+  const inner = b.body;
+  if (
+    inner &&
+    typeof inner === "object" &&
+    !Array.isArray(inner) &&
+    (inner.sessionId != null ||
+      inner.phone != null ||
+      inner.chatInput != null ||
+      inner.mediaBase64 != null)
+  ) {
+    return inner;
+  }
+  return b;
+}
+
 app.post("/webhook/chat", async (req, res) => {
   try {
-    const payload = normalizeChatPayload(req.body);
-    enrichChatPayload(payload, req.body);
+    const rawBody = unwrapIncomingBody(req.body);
+    const payload = normalizeChatPayload(rawBody);
+    enrichChatPayload(payload, rawBody);
     const ctx = await loadContext(payload.sessionId);
     const text = String(payload.chatInput || "").trim();
     const resumeHint = hasResumeHint(payload, text);
 
-    // 1) Primeiro conversa/entende intenção (triagem com contexto)
-    let intent = await classifyIntent(payload, ctx);
-    if (resumeHint) intent = "candidate";
+    // 1) Triagem: com anexo de currículo não chama a IA de classificação (evita falha extra + custo)
+    let intent = "general";
+    if (resumeHint) {
+      intent = "candidate";
+    } else {
+      try {
+        intent = await classifyIntent(payload, ctx);
+      } catch (_e) {
+        intent = "general";
+      }
+    }
     if (/candidatar|curricul|currículo/i.test(text)) intent = "candidate";
 
     let aiMessage = "";
+    let lastOpenAiError = null;
 
     // 2) Se já está pendente de confirmação e usuário confirmou, salva
     if (ctx.pendingConfirmation && isYes(text) && ctx.pendingResume) {
@@ -653,21 +692,28 @@ app.post("/webhook/chat", async (req, res) => {
           aiMessage =
             "Recebi o arquivo, mas sem o conteúdo para leitura. Reenvie o currículo como PDF/imagem/DOCX com o arquivo anexado corretamente para eu extrair os dados.";
         } else {
-          const extracted = await extractResumeData(payload);
-          if (!extracted) {
+          try {
+            const extracted = await extractResumeData(payload);
+            if (!extracted) {
+              aiMessage =
+                "Não consegui extrair os dados do currículo. Pode reenviar o arquivo, por favor?";
+            } else {
+              ctx.pendingResume = extracted;
+              ctx.pendingConfirmation = true;
+              aiMessage =
+                `Encontrei estes dados no currículo:\n` +
+                `Nome: ${extracted.fullName || "Não encontrado"}\n` +
+                `Email: ${extracted.email || "Não encontrado"}\n` +
+                `Telefone: ${extracted.phone || payload.phone || "Não encontrado"}\n` +
+                `Cidade: ${extracted.city || "Não encontrado"}\n` +
+                `Cargo de interesse: ${extracted.jobInterest || "Não encontrado"}\n\n` +
+                `Se estiver tudo certo, responda SIM para eu salvar.`;
+            }
+          } catch (e) {
+            lastOpenAiError = String(e?.message || e);
             aiMessage =
-              "Não consegui extrair os dados do currículo. Pode reenviar o arquivo, por favor?";
-          } else {
-            ctx.pendingResume = extracted;
-            ctx.pendingConfirmation = true;
-            aiMessage =
-              `Encontrei estes dados no currículo:\n` +
-              `Nome: ${extracted.fullName || "Não encontrado"}\n` +
-              `Email: ${extracted.email || "Não encontrado"}\n` +
-              `Telefone: ${extracted.phone || payload.phone || "Não encontrado"}\n` +
-              `Cidade: ${extracted.city || "Não encontrado"}\n` +
-              `Cargo de interesse: ${extracted.jobInterest || "Não encontrado"}\n\n` +
-              `Se estiver tudo certo, responda SIM para eu salvar.`;
+              "Não consegui concluir a leitura com a IA neste momento. Tente de novo em alguns instantes; se continuar, envie o currículo em PDF com texto selecionável ou em Word.";
+            intent = "candidate";
           }
         }
       } else {
@@ -695,6 +741,9 @@ app.post("/webhook/chat", async (req, res) => {
       phone: payload.phone || null,
       intent,
       message: aiMessage,
+      ...(lastOpenAiError
+        ? { openai_error: lastOpenAiError.slice(0, 500) }
+        : {}),
       mychatPayload: {
         number: payload.phone || payload.sessionId,
         body: aiMessage,
