@@ -55,9 +55,65 @@ function isDocumentLikeInRaw(raw) {
   const c = raw.content ?? raw.message ?? {};
   const t = String(c.type || raw.type || "").toLowerCase();
   if (t === "document" || t === "image") return true;
+  if (t.includes("message_n8n") || t.includes("n8n")) return true;
   if (c.document || c.image || raw.document || raw.image) return true;
+  if (raw.media || raw.attachment || raw.attachments || raw.document) return true;
   if (raw.messages?.[0]?.message?.documentMessage) return true;
   return false;
+}
+
+function deepFindFileHints(obj, depth = 0) {
+  if (depth > 12 || !obj || typeof obj !== "object") return {};
+  let fileName;
+  let mimetype;
+  for (const [k, v] of Object.entries(obj)) {
+    const kl = k.toLowerCase();
+    if (
+      typeof v === "string" &&
+      v.length > 0 &&
+      v.length < 512 &&
+      (kl === "filename" ||
+        kl === "name" ||
+        kl === "originalname" ||
+        kl === "file_name")
+    ) {
+      fileName = fileName || v;
+    }
+    if (
+      typeof v === "string" &&
+      v.length < 200 &&
+      (kl === "mimetype" ||
+        kl === "contenttype" ||
+        kl === "content_type" ||
+        kl === "mime" ||
+        kl === "mime_type")
+    ) {
+      mimetype = mimetype || String(v).toLowerCase();
+    }
+    if (typeof v === "object" && v !== null) {
+      const inner = deepFindFileHints(v, depth + 1);
+      if (inner.fileName && !fileName) fileName = inner.fileName;
+      if (inner.mimetype && !mimetype) mimetype = inner.mimetype;
+    }
+  }
+  return { fileName, mimetype };
+}
+
+/** Decodifica base64 vinda do WhatsApp/n8n (data URL, URL-safe, padding). */
+function decodeBase64ToBuffer(raw) {
+  if (raw == null || raw === "") return null;
+  let s = String(raw).trim();
+  const dataUrl = s.match(/^data:([^;]*);base64,\s*(.+)$/is);
+  if (dataUrl) s = dataUrl[2];
+  s = s.replace(/\s/g, "").replace(/-/g, "+").replace(/_/g, "/");
+  const mod = s.length % 4;
+  if (mod) s += "=".repeat(4 - mod);
+  try {
+    const buf = Buffer.from(s, "base64");
+    return buf.length ? buf : null;
+  } catch (_e) {
+    return null;
+  }
 }
 
 function pickFileMetaFromObject(obj) {
@@ -112,6 +168,17 @@ function enrichChatPayload(payload, body) {
 
   if (!payload.fileName && !payload.mimetype && isDocumentLikeInRaw(payload.rawPayload)) {
     payload.mimetype = payload.mimetype || "application/pdf";
+  }
+
+  if (
+    (!payload.fileName || !payload.mimetype) &&
+    payload.rawPayload &&
+    typeof payload.rawPayload === "object"
+  ) {
+    const hints = deepFindFileHints(payload.rawPayload);
+    if (!payload.fileName && hints.fileName) payload.fileName = hints.fileName;
+    if (!payload.mimetype && hints.mimetype)
+      payload.mimetype = String(hints.mimetype).toLowerCase();
   }
 }
 
@@ -170,12 +237,22 @@ function normalizeChatPayload(body) {
   };
 }
 
-async function askAI({ chatInput, history }) {
+async function askAI({
+  chatInput,
+  history,
+  prependLuizaSystem = true,
+  thinking = true,
+  max_tokens: maxTokens,
+  temperature = 1,
+}) {
   if (!NVIDIA_API_KEY) {
     throw new Error("Defina NVIDIA_API_KEY no ambiente.");
   }
 
-  const messages = [{ role: "system", content: DEFAULT_SYSTEM_PROMPT }];
+  const messages = [];
+  if (prependLuizaSystem) {
+    messages.push({ role: "system", content: DEFAULT_SYSTEM_PROMPT });
+  }
 
   for (const item of history) {
     if (!item || typeof item !== "object") continue;
@@ -197,11 +274,11 @@ async function askAI({ chatInput, history }) {
     },
     body: JSON.stringify({
       model: NVIDIA_MODEL,
-      max_tokens: 16384,
-      temperature: 1,
+      max_tokens: maxTokens != null ? maxTokens : 16384,
+      temperature,
       top_p: 1,
       stream: false,
-      chat_template_kwargs: { thinking: true },
+      ...(thinking ? { chat_template_kwargs: { thinking: true } } : {}),
       messages,
     }),
   }
@@ -331,22 +408,22 @@ const MAX_RESUME_TEXT_FOR_LLM = 85000;
 
 async function plainTextFromResumeMedia(payload) {
   if (!payload.mediaBase64) return { text: null, error: "sem_base64" };
-  let buffer;
-  try {
-    buffer = Buffer.from(
-      String(payload.mediaBase64).replace(/\s/g, ""),
-      "base64"
-    );
-  } catch (_e) {
-    return { text: null, error: "decode" };
-  }
-  if (!buffer.length) return { text: null, error: "vazio" };
+  const buffer = decodeBase64ToBuffer(payload.mediaBase64);
+  if (!buffer || !buffer.length) return { text: null, error: "decode" };
 
   const mt = String(payload.mimetype || "").toLowerCase();
   const name = String(payload.fileName || "").toLowerCase();
   const isPdfMagic = buffer.slice(0, 4).toString("ascii") === "%PDF";
   const isZipMagic = buffer[0] === 0x50 && buffer[1] === 0x4b;
-  const minLen = 25;
+  const isJpegMagic = buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xd8;
+  const isPngMagic =
+    buffer.length >= 8 &&
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47;
+  /** Texto mínimo (currículos com poucas linhas ou PDF com pouco texto legível). */
+  const minLen = 8;
 
   const tryPdf = async () => {
     const pdfParse = require("pdf-parse");
@@ -359,6 +436,10 @@ async function plainTextFromResumeMedia(payload) {
     const r = await mammoth.extractRawText({ buffer });
     return (r.value || "").replace(/\s+/g, " ").trim();
   };
+
+  if (!isPdfMagic && (isJpegMagic || isPngMagic)) {
+    return { text: null, error: "imagem" };
+  }
 
   try {
     if (isPdfMagic) {
@@ -435,8 +516,16 @@ async function extractResumeData(payload) {
           "Você é extrator de currículo. Responda apenas JSON. Use null se um campo não aparecer no texto.",
       },
     ],
+    prependLuizaSystem: false,
+    thinking: false,
+    max_tokens: 2048,
+    temperature: 0.2,
   });
-  const match = out.match(/\{[\s\S]*\}/);
+  const stripped = String(out)
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```\s*$/i, "")
+    .trim();
+  const match = stripped.match(/\{[\s\S]*\}/);
   if (!match) return null;
   try {
     return JSON.parse(match[0]);
