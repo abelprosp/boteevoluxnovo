@@ -1,0 +1,209 @@
+{
+  "name": "Evolux - Webhook -> API IA -> MyChat",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "webhook-evolux",
+        "options": {}
+      },
+      "id": "4eb7ad2e-2d91-4d62-9b83-c0f7853b824d",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-1160, 260],
+      "webhookId": "evolux-webhook-chat"
+    },
+    {
+      "parameters": {
+        "functionCode": "const body = $json.body || {};\nconst content = body.content || {};\nconst contact = body.contact || {};\n\nconst rawMessage = content.text || content.body || body.message || body.chatInput || '';\nlet phone = String(contact.number || body.phone || '').replace(/\\D/g, '');\nif (!phone) return [{ json: { ignore: true } }];\nif (!phone.startsWith('55')) phone = '55' + phone;\n\nconst chatInput = String(rawMessage || '').trim();\nif (!chatInput) return [{ json: { ignore: true } }];\n\nreturn [{ json: { ignore: false, phone, sessionId: phone, chatInput, history: [] } }];"
+      },
+      "id": "76ed2fb0-7a43-4789-9d58-b16e3a9259bb",
+      "name": "Normalizar Entrada",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [-920, 260]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.ignore }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "68c368a8-26a4-4f9d-9d53-c4f13a9d9fd6",
+      "name": "Filtrar Invalidas",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-700, 260]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.chatInput }}",
+              "rightValue": "vaga",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f4c55af5-4d8e-4f0d-b6ff-3038f18fa635",
+      "name": "Tem Palavra Vaga?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-460, 260]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://SEU-PROJETO.vercel.app/jobs?limit=10",
+        "options": {}
+      },
+      "id": "c1dbdd27-207e-4a01-a4fa-2748cae5f4d1",
+      "name": "Consultar Jobs API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [-220, 140]
+    },
+    {
+      "parameters": {
+        "functionCode": "const jobsResp = $input.first().json || {};\nconst original = $('Tem Palavra Vaga?').first().json;\n\nconst jobs = Array.isArray(jobsResp.jobs) ? jobsResp.jobs : [];\nconst resumo = jobs.length\n  ? jobs.slice(0, 10).map((j, i) => `${i + 1}. ${j.title || j.job_title || 'Vaga sem titulo'}${j.location ? ' - ' + j.location : ''}`).join('\\n')\n  : 'Sem vagas listadas no momento.';\n\nconst enriched = `${original.chatInput}\\n\\n[CONTEXTO_JOBS]\\n${resumo}`;\n\nreturn [{\n  json: {\n    ...original,\n    history: [\n      {\n        role: 'system',\n        content: 'Use as vagas do bloco [CONTEXTO_JOBS] para responder de forma objetiva e convidar o candidato para o site evoluxrh.com.br.'\n      }\n    ],\n    chatInput: enriched\n  }\n}];"
+      },
+      "id": "ba92ec4c-f884-4ec6-a44c-e1ce3f5c39de",
+      "name": "Injetar Contexto Vagas",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [20, 140]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://SEU-PROJETO.vercel.app/webhook/chat",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chatInput: $json.chatInput, phone: $json.phone, sessionId: $json.sessionId, history: $json.history || [] }) }}",
+        "options": {}
+      },
+      "id": "cedaf33c-8c41-4a4d-b39b-b81de0b47f95",
+      "name": "Chamar API IA",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [260, 260]
+    },
+    {
+      "parameters": {
+        "functionCode": "const item = $input.first().json;\nconst mychatPayload = item.mychatPayload || {};\nconst number = String(mychatPayload.number || item.phone || '').replace(/\\D/g, '');\nconst body = String(mychatPayload.body || item.message || '').replace(/[\\r\\n]+/g, ' ').trim();\nif (!number || !body) throw new Error('Resposta da API IA sem number/body');\n\nreturn [{ json: {\n  number,\n  body,\n  externalKey: mychatPayload.externalKey || `lead_${number}`,\n  isClosed: mychatPayload.isClosed === true\n} }];"
+      },
+      "id": "e8363d10-97f2-4836-a2c8-f6e5f6f2807d",
+      "name": "Formatar MyChat",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [500, 260]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.prime.mychatbot.com.br/v2/api/external/b92b0d0b-cd7d-41ad-b7ac-6a339bd8895e",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer COLOQUE_SEU_TOKEN_AQUI"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ number: $json.number, body: $json.body, externalKey: $json.externalKey, isClosed: $json.isClosed }) }}",
+        "options": {}
+      },
+      "id": "45f10f67-6b94-4887-a572-7df29d4ff0ce",
+      "name": "Enviar MyChat",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [740, 260]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [[{ "node": "Normalizar Entrada", "type": "main", "index": 0 }]]
+    },
+    "Normalizar Entrada": {
+      "main": [[{ "node": "Filtrar Invalidas", "type": "main", "index": 0 }]]
+    },
+    "Filtrar Invalidas": {
+      "main": [
+        [],
+        [{ "node": "Tem Palavra Vaga?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Tem Palavra Vaga?": {
+      "main": [
+        [{ "node": "Consultar Jobs API", "type": "main", "index": 0 }],
+        [{ "node": "Chamar API IA", "type": "main", "index": 0 }]
+      ]
+    },
+    "Consultar Jobs API": {
+      "main": [[{ "node": "Injetar Contexto Vagas", "type": "main", "index": 0 }]]
+    },
+    "Injetar Contexto Vagas": {
+      "main": [[{ "node": "Chamar API IA", "type": "main", "index": 0 }]]
+    },
+    "Chamar API IA": {
+      "main": [[{ "node": "Formatar MyChat", "type": "main", "index": 0 }]]
+    },
+    "Formatar MyChat": {
+      "main": [[{ "node": "Enviar MyChat", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "4ac8d681-af4f-4a9e-b630-f17d4fa7b218",
+  "meta": {
+    "instanceId": "evolux-instance"
+  },
+  "id": "EvoluxWebhookApiMychat",
+  "tags": []
+}
