@@ -351,6 +351,33 @@ function isYes(text) {
   );
 }
 
+/** Detecta texto de candidatura sem depender de acentos (ex.: currículo vs curriculo). */
+function matchesCandidateKeywords(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  const n = raw
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+
+  if (n.includes("interessei") && n.includes("curricul")) return true;
+
+  const patterns = [
+    /quero\s+(me\s+)?candidat/,
+    /candidatur/,
+    /curricul/,
+    /me\s+candidatar/,
+    /enviar?\s+(o\s+|meu\s+)?curricul/,
+    /envio\s+(o\s+|meu\s+)?curricul/,
+    /mand(ar|o)?\s+(o\s+|meu\s+)?curricul/,
+    /\b(anex(ar|o)|mando)\s+(o\s+)?curricul/,
+    /\b(inscreve|me\s+cadastra)\b.*\bvag(a|as)\b/,
+    /\bvaga(s)?\b.*\b(empresa|trampo|oportunidade|candidato)\b/,
+  ];
+
+  return patterns.some((re) => re.test(n));
+}
+
 async function loadContext(sessionId) {
   const local = contextMemory.get(sessionId);
   try {
@@ -652,10 +679,11 @@ app.post("/webhook/chat", async (req, res) => {
     const ctx = await loadContext(payload.sessionId);
     const text = String(payload.chatInput || "").trim();
     const resumeHint = hasResumeHint(payload, text);
+    const textualCandidateCue = matchesCandidateKeywords(text);
 
-    // 1) Triagem: com anexo de currículo não chama a IA de classificação (evita falha extra + custo)
+    // 1) Triagem: anexo OU mensagem clara de candidatura/interesse não chama OpenAI só para classificar
     let intent = "general";
-    if (resumeHint) {
+    if (resumeHint || textualCandidateCue) {
       intent = "candidate";
     } else {
       try {
@@ -664,7 +692,7 @@ app.post("/webhook/chat", async (req, res) => {
         intent = "general";
       }
     }
-    if (/candidatar|curricul|currículo/i.test(text)) intent = "candidate";
+    if (matchesCandidateKeywords(text)) intent = "candidate";
 
     let aiMessage = "";
     let lastOpenAiError = null;
@@ -722,10 +750,16 @@ app.post("/webhook/chat", async (req, res) => {
           "Perfeito! Para se candidatar, envie seu currículo em PDF, imagem ou DOCX para eu extrair os dados e confirmar com você.";
       }
     } else {
-      aiMessage = await askAI({
-        chatInput: text || "Olá",
-        history: ctx.recentTurns.slice(-6),
-      });
+      try {
+        aiMessage = await askAI({
+          chatInput: text || "Olá",
+          history: ctx.recentTurns.slice(-6),
+        });
+      } catch (e) {
+        aiMessage =
+          "Desculpe, não consegui contactar o serviço de IA agora. Tente mais tarde ou escreva se quer candidatar-se, vagas ou falar como empresa.";
+        lastOpenAiError = String(e?.message || e);
+      }
     }
 
     ctx.recentTurns = [
