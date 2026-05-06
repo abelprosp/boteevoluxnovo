@@ -326,26 +326,123 @@ async function classifyIntent(payload, ctx) {
   return "general";
 }
 
+/** Limite de caracteres enviados ao modelo (evita estourar contexto). */
+const MAX_RESUME_TEXT_FOR_LLM = 85000;
+
+async function plainTextFromResumeMedia(payload) {
+  if (!payload.mediaBase64) return { text: null, error: "sem_base64" };
+  let buffer;
+  try {
+    buffer = Buffer.from(
+      String(payload.mediaBase64).replace(/\s/g, ""),
+      "base64"
+    );
+  } catch (_e) {
+    return { text: null, error: "decode" };
+  }
+  if (!buffer.length) return { text: null, error: "vazio" };
+
+  const mt = String(payload.mimetype || "").toLowerCase();
+  const name = String(payload.fileName || "").toLowerCase();
+  const isPdfMagic = buffer.slice(0, 4).toString("ascii") === "%PDF";
+  const isZipMagic = buffer[0] === 0x50 && buffer[1] === 0x4b;
+  const minLen = 25;
+
+  const tryPdf = async () => {
+    const pdfParse = require("pdf-parse");
+    const data = await pdfParse(buffer);
+    return (data.text || "").replace(/\s+/g, " ").trim();
+  };
+
+  const tryDocx = async () => {
+    const mammoth = require("mammoth");
+    const r = await mammoth.extractRawText({ buffer });
+    return (r.value || "").replace(/\s+/g, " ").trim();
+  };
+
+  try {
+    if (isPdfMagic) {
+      const t = await tryPdf();
+      if (t.length >= minLen) return { text: t, error: null };
+      return { text: null, error: "pdf_sem_texto" };
+    }
+    if (isZipMagic) {
+      try {
+        const t = await tryDocx();
+        if (t.length >= minLen) return { text: t, error: null };
+      } catch (_e) {
+        /* xlsx também é ZIP; segue para outros fallbacks */
+      }
+    }
+    if (mt.includes("pdf") || name.endsWith(".pdf")) {
+      const t = await tryPdf();
+      if (t.length >= minLen) return { text: t, error: null };
+    }
+    if (
+      name.endsWith(".docx") ||
+      mt.includes("officedocument.wordprocessingml") ||
+      mt.includes("wordprocessingml")
+    ) {
+      const t = await tryDocx();
+      if (t.length >= minLen) return { text: t, error: null };
+    }
+  } catch (e) {
+    return { text: null, error: String(e.message || e) };
+  }
+
+  if (mt.startsWith("image/") || /\.(png|jpe?g|gif|webp)$/i.test(name)) {
+    return { text: null, error: "imagem" };
+  }
+
+  try {
+    const t = await tryPdf();
+    if (t.length >= minLen) return { text: t, error: null };
+  } catch (_e) {}
+
+  try {
+    const t = await tryDocx();
+    if (t.length >= minLen) return { text: t, error: null };
+  } catch (_e) {}
+
+  return { text: null, error: "formato" };
+}
+
 async function extractResumeData(payload) {
   if (!payload.mediaBase64) return null;
+
+  const { text } = await plainTextFromResumeMedia(payload);
+  if (!text) return null;
+
+  const body =
+    text.length > MAX_RESUME_TEXT_FOR_LLM
+      ? `${text.slice(0, MAX_RESUME_TEXT_FOR_LLM)}\n\n[... texto truncado para análise ...]`
+      : text;
+
   const prompt =
-    "Extraia dados de currículo e retorne APENAS JSON válido: " +
-    '{"fullName":null,"email":null,"phone":null,"city":null,"jobInterest":null} ' +
+    "Extraia dados de currículo a partir do TEXTO abaixo. Retorne APENAS JSON válido: " +
+    '{"fullName":null,"email":null,"phone":null,"city":null,"jobInterest":null}\n\n' +
     `Arquivo: ${payload.fileName || "curriculo"}; mimetype: ${
       payload.mimetype || "desconhecido"
-    }; base64: ${payload.mediaBase64}`;
+    }\n\n` +
+    `Texto do currículo:\n${body}`;
+
   const out = await askAI({
     chatInput: prompt,
     history: [
       {
         role: "system",
-        content: "Você é extrator de currículo. Responda apenas JSON.",
+        content:
+          "Você é extrator de currículo. Responda apenas JSON. Use null se um campo não aparecer no texto.",
       },
     ],
   });
   const match = out.match(/\{[\s\S]*\}/);
   if (!match) return null;
-  return JSON.parse(match[0]);
+  try {
+    return JSON.parse(match[0]);
+  } catch (_e) {
+    return null;
+  }
 }
 
 async function saveResumeFromContext(phone, payload, extracted) {
