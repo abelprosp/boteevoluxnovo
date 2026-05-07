@@ -33,14 +33,27 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 });
 
 function normalizeResumePayload(body) {
+  const fallbackFileName =
+    String(body.fileName ?? body.file_name ?? "").trim() || "curriculo";
+  /** Caminho sintético para tabelas com `file_path` NOT NULL (confirmação "SIM" vem sem anexo novo). */
+  const fallbackFilePath = `webhook/evolux/${String(
+    body.sessionId ??
+      body.candidate_phone ??
+      body.phone ??
+      body.fileSessionKey ??
+      "sessao"
+  ).replace(/\D/g, "") || "sem-sessao"}/${encodeURIComponent(fallbackFileName)}`;
+  const file_name = body.fileName ?? body.file_name ?? fallbackFileName;
+  const file_path = body.filePath ?? body.file_path ?? fallbackFilePath;
+
   const payload = {
     candidate_name: body.fullName ?? body.candidate_name ?? null,
     candidate_email: body.email ?? body.candidate_email ?? null,
     candidate_phone: body.phone ?? body.candidate_phone ?? null,
     city: body.city ?? null,
     position_of_interest: body.jobInterest ?? body.position_of_interest ?? null,
-    file_name: body.fileName ?? body.file_name ?? null,
-    file_path: body.filePath ?? body.file_path ?? null,
+    file_name,
+    file_path,
     file_size:
       body.fileSize != null
         ? Number(body.fileSize)
@@ -743,15 +756,32 @@ async function extractResumeData(payload) {
 }
 
 async function saveResumeFromContext(phone, payload, extracted) {
+  const ingest =
+    extracted && typeof extracted === "object" ? extracted._ingest || {} : {};
+  const nameFromPrior =
+    String(ingest.fileName || ingest.displayName || "").trim() ||
+    "";
+  const fileNameMerged =
+    String(payload.fileName || nameFromPrior || "").trim() || null;
+  const mimeMerged =
+    String(payload.mimetype || ingest.mimetype || "").trim() || null;
+
   const resume = normalizeResumePayload({
     fullName: extracted?.fullName ?? null,
     email: extracted?.email ?? null,
     phone: phone,
     city: extracted?.city ?? null,
     jobInterest: extracted?.jobInterest ?? null,
-    fileName: payload.fileName ?? null,
-    fileSize: null,
-    mimetype: payload.mimetype ?? null,
+    fileName: fileNameMerged,
+    fileSize: ingest.fileSize != null ? ingest.fileSize : null,
+    mimetype:
+      mimeMerged ||
+      (nameFromPrior.toLowerCase().endsWith(".pdf") ? "application/pdf" : null),
+    filePath:
+      ingest.filePath ||
+      (ingest.bucketKey ? String(ingest.bucketKey) : null) ||
+      null,
+    fileSessionKey: ingest.sessionId || payload.sessionId,
   });
   const { data, error } = await supabase
     .from("resumes")
@@ -844,10 +874,17 @@ app.post("/webhook/chat", async (req, res) => {
           if (!extracted) {
             aiMessage =
               "Não consegui extrair os dados do currículo. Pode reenviar o arquivo, por favor?";
-          } else {
-            ctx.pendingResume = extracted;
-            ctx.pendingConfirmation = true;
-            aiMessage =
+            } else {
+              ctx.pendingResume = {
+                ...extracted,
+                _ingest: {
+                  fileName: payload.fileName,
+                  mimetype: payload.mimetype,
+                  sessionId: payload.sessionId,
+                },
+              };
+              ctx.pendingConfirmation = true;
+              aiMessage =
               `Encontrei estes dados no currículo:\n` +
               `Nome: ${extracted.fullName || "Não encontrado"}\n` +
               `Email: ${extracted.email || "Não encontrado"}\n` +
