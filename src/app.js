@@ -63,7 +63,6 @@ function isDocumentLikeInRaw(raw) {
   const c = raw.content ?? raw.message ?? {};
   const t = String(c.type || raw.type || "").toLowerCase();
   if (t === "document" || t === "image") return true;
-  if (t.includes("message_n8n") || t.includes("n8n")) return true;
   if (c.document || c.image || raw.document || raw.image) return true;
   if (raw.media || raw.attachment || raw.attachments || raw.document) return true;
   if (raw.messages?.[0]?.message?.documentMessage) return true;
@@ -377,15 +376,33 @@ function deepFindBase64String(obj, depth = 0) {
   return null;
 }
 
+/** Indica arquivo de currículo no payload (WhatsApp/n8n), não só envelope genérico. */
+function hasInboundResumeFile(payload) {
+  const b64Len = payload.mediaBase64
+    ? String(payload.mediaBase64).replace(/\s/g, "").length
+    : 0;
+  if (b64Len > 48) return true;
+  const raw = payload.rawPayload;
+  if (!raw || typeof raw !== "object") return false;
+  const c = raw.content ?? raw.message ?? {};
+  if (c.document || c.image || raw.document || raw.image) return true;
+  if (raw.messages?.[0]?.message?.documentMessage) return true;
+  const typ = String(c.type || raw.type || "").toLowerCase();
+  if (typ === "document" || typ === "image") return true;
+  if (raw.media && String(raw.media).length > 16) return true;
+  if (raw.attachment && typeof raw.attachment === "object") return true;
+  if (Array.isArray(raw.attachments) && raw.attachments.length > 0) return true;
+  return false;
+}
+
 function hasResumeHint(payload, text) {
+  if (hasInboundResumeFile(payload)) return true;
   const name = String(payload.fileName || "").toLowerCase();
   const mt = String(payload.mimetype || "").toLowerCase();
   const ti = String(text || "").toLowerCase().trim();
-  if (isDocumentLikeInRaw(payload.rawPayload)) return true;
   if ((ti === "document" || ti === "image" || ti === "[anexo]") && payload.rawPayload)
     return true;
   return (
-    !!payload.mediaBase64 ||
     name.endsWith(".pdf") ||
     name.endsWith(".doc") ||
     name.endsWith(".docx") ||
@@ -402,15 +419,20 @@ function hasResumeHint(payload, text) {
 }
 
 function isYes(text) {
-  const base = String(text || "")
+  const t = String(text || "")
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .trim()
-    .replace(/^["'“”‘’\s,.:;!?¿¡]+|["'“”‘’\s,.:;!?]+$/g, "")
     .toLowerCase();
-  return /^(sim|s|confirmo|ok|correto|pode salvar|pode cadastrar|ta certo)$/.test(
-    base
-  );
+  if (!t) return false;
+  const trimmed = t.replace(/^[`"'„«»¡¿\s\-–.:;]+/, "").trim();
+  if (
+    /^(sim|si|s|confirmo|ok|correto)([\s,.:;!?…\-–]*|$)/i.test(trimmed)
+  )
+    return true;
+  if (/^pode (salvar|cadastrar)\b/i.test(trimmed)) return true;
+  if (/^ta certo\b/i.test(trimmed)) return true;
+  return /\b(sim|confirmo|ok|correto)\b/i.test(trimmed);
 }
 
 /** Detecta texto de candidatura sem depender de acentos (ex.: currículo vs curriculo). */
@@ -495,6 +517,55 @@ async function saveContext(sessionId, state) {
     console.error("[conversation_cache] upsert exceção:", sessionId, msg);
     return { error: msg };
   }
+}
+
+function digitsOnlySessionKey(v) {
+  const d = String(v ?? "").replace(/\D/g, "");
+  return d.length >= 10 ? d : "";
+}
+
+/** Se o estado foi salvo sob outra chave (ex.: só sessionId vs só phone), recupera confirmação pendente. */
+function alternateConversationLookupIds(body, canonicalSessionId) {
+  const canonDigits = digitsOnlySessionKey(canonicalSessionId);
+  const out = [];
+  const add = (v) => {
+    const d = digitsOnlySessionKey(v);
+    if (!d || d === canonDigits) return;
+    if (!out.includes(d)) out.push(d);
+  };
+  if (!body || typeof body !== "object") return out;
+  add(body.phone);
+  add(body.sessionId);
+  try {
+    add(body.contact?.number);
+  } catch (_e) {}
+  const inner = body.body;
+  if (inner && typeof inner === "object") {
+    add(inner.phone);
+    add(inner.sessionId);
+    try {
+      add(inner.contact?.number);
+    } catch (_e) {}
+  }
+  try {
+    add(body.rawPayload?.contact?.number);
+    add(body.rawPayload?.phone);
+    add(body.rawPayload?.sessionId);
+  } catch (_e) {}
+  return out;
+}
+
+async function loadConversationContextForRequest(payload, rawBody) {
+  const canonKey = payload.sessionId;
+  let ctx = await loadContext(canonKey);
+  if (ctx.pendingConfirmation && ctx.pendingResume) return ctx;
+  for (const alt of alternateConversationLookupIds(rawBody, canonKey)) {
+    const altCtx = await loadContext(alt);
+    if (altCtx.pendingConfirmation && altCtx.pendingResume) {
+      return altCtx;
+    }
+  }
+  return ctx;
 }
 
 async function classifyIntent(payload, ctx) {
@@ -718,7 +789,7 @@ app.post("/webhook/chat", async (req, res) => {
     const rawBody = unwrapIncomingBody(req.body);
     const payload = normalizeChatPayload(rawBody);
     enrichChatPayload(payload, rawBody);
-    const ctx = await loadContext(payload.sessionId);
+    const ctx = await loadConversationContextForRequest(payload, rawBody);
     const text = String(payload.chatInput || "").trim();
     const resumeHint = hasResumeHint(payload, text);
     const textualCandidateCue = matchesCandidateKeywords(text);
@@ -758,39 +829,43 @@ app.post("/webhook/chat", async (req, res) => {
         "Temos vagas sim. Veja todas as oportunidades atualizadas em https://evoluxrh.com.br";
     } else if (intent === "candidate") {
       ctx.lastIntent = "candidate";
-      if (resumeHint) {
+      const resumeBytesLen = payload.mediaBase64
+        ? String(payload.mediaBase64).replace(/\s/g, "").length
+        : 0;
+      const hasResumeBinary = resumeBytesLen > 48;
+
+      if (resumeHint && hasResumeBinary) {
         ctx.awaitingResume = false;
-        if (!payload.mediaBase64) {
-          aiMessage =
-            "Recebi o arquivo, mas sem o conteúdo para leitura. Reenvie o currículo como PDF/imagem/DOCX com o arquivo anexado corretamente para eu extrair os dados.";
-        } else {
-          try {
-            const { data: extracted, error: extractionError } = await extractResumeData(
-              payload
-            );
-            lastResumeExtractionError = extractionError || null;
-            if (!extracted) {
-              aiMessage =
-                "Não consegui extrair os dados do currículo. Pode reenviar o arquivo, por favor?";
-            } else {
-              ctx.pendingResume = extracted;
-              ctx.pendingConfirmation = true;
-              aiMessage =
-                `Encontrei estes dados no currículo:\n` +
-                `Nome: ${extracted.fullName || "Não encontrado"}\n` +
-                `Email: ${extracted.email || "Não encontrado"}\n` +
-                `Telefone: ${extracted.phone || payload.phone || "Não encontrado"}\n` +
-                `Cidade: ${extracted.city || "Não encontrado"}\n` +
-                `Cargo de interesse: ${extracted.jobInterest || "Não encontrado"}\n\n` +
-                `Se estiver tudo certo, responda SIM para eu salvar.`;
-            }
-          } catch (e) {
-            lastOpenAiError = String(e?.message || e);
+        try {
+          const { data: extracted, error: extractionError } = await extractResumeData(
+            payload
+          );
+          lastResumeExtractionError = extractionError || null;
+          if (!extracted) {
             aiMessage =
-              "Não consegui concluir a leitura com a IA neste momento. Tente de novo em alguns instantes; se continuar, envie o currículo em PDF com texto selecionável ou em Word.";
-            intent = "candidate";
+              "Não consegui extrair os dados do currículo. Pode reenviar o arquivo, por favor?";
+          } else {
+            ctx.pendingResume = extracted;
+            ctx.pendingConfirmation = true;
+            aiMessage =
+              `Encontrei estes dados no currículo:\n` +
+              `Nome: ${extracted.fullName || "Não encontrado"}\n` +
+              `Email: ${extracted.email || "Não encontrado"}\n` +
+              `Telefone: ${extracted.phone || payload.phone || "Não encontrado"}\n` +
+              `Cidade: ${extracted.city || "Não encontrado"}\n` +
+              `Cargo de interesse: ${extracted.jobInterest || "Não encontrado"}\n\n` +
+              `Se estiver tudo certo, responda SIM para eu salvar.`;
           }
+        } catch (e) {
+          lastOpenAiError = String(e?.message || e);
+          aiMessage =
+            "Não consegui concluir a leitura com a IA neste momento. Tente de novo em alguns instantes; se continuar, envie o currículo em PDF com texto selecionável ou em Word.";
+          intent = "candidate";
         }
+      } else if (resumeHint && !hasResumeBinary) {
+        ctx.awaitingResume = false;
+        aiMessage =
+          "Recebi o arquivo, mas sem o conteúdo para leitura. Reenvie o currículo como PDF/imagem/DOCX com o arquivo anexado corretamente para eu extrair os dados.";
       } else {
         ctx.awaitingResume = true;
         aiMessage =
