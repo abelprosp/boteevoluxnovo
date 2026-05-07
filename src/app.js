@@ -1060,6 +1060,17 @@ async function saveResumeFromContext(phone, payload, extracted) {
   return inserted;
 }
 
+async function ensureResumeSavedOrThrow(phone, payload, extracted) {
+  const saved = await saveResumeFromContext(phone, payload, extracted);
+  if (!saved || typeof saved !== "object") {
+    throw new Error("Falha ao salvar currículo: retorno vazio");
+  }
+  if (!saved.id) {
+    throw new Error("Falha ao salvar currículo: id ausente no retorno");
+  }
+  return saved;
+}
+
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "evolux-api" });
 });
@@ -1091,6 +1102,11 @@ app.post("/webhook/chat", async (req, res) => {
     const text = String(payload.chatInput || "").trim();
     const resumeHint = hasResumeHint(payload, text);
     const textualCandidateCue = matchesCandidateKeywords(text);
+    const draftAgeMs = ctx.lastDraftAt
+      ? Date.now() - new Date(ctx.lastDraftAt).getTime()
+      : Number.POSITIVE_INFINITY;
+    const hasRecoverableDraft =
+      !!ctx.lastDraftResume && Number.isFinite(draftAgeMs) && draftAgeMs <= 48 * 60 * 60 * 1000;
 
     // 1) Triagem: anexo OU mensagem clara de candidatura/interesse não chama OpenAI só para classificar
     let intent = "general";
@@ -1125,12 +1141,14 @@ app.post("/webhook/chat", async (req, res) => {
             "Perdi o rascunho desta candidatura. Reenvie o currículo para eu continuar do ponto certo.";
           return;
         }
-        const saved = await saveResumeFromContext(whatsappDig, payload, sourceResume);
+        const saved = await ensureResumeSavedOrThrow(whatsappDig, payload, sourceResume);
         ctx.pendingConfirmation = false;
         ctx.pendingResume = null;
         ctx.lastIntent = "candidate";
         ctx.lastSavedResume = saved || null;
         ctx.lastSavedResumeAt = new Date().toISOString();
+        ctx.lastDraftResume = null;
+        ctx.lastDraftAt = null;
         aiMessage = "Perfeito! Candidatura registrada com sucesso. Obrigado.";
       };
 
@@ -1160,11 +1178,27 @@ app.post("/webhook/chat", async (req, res) => {
       if (trimmed.length && correctionIntentHeuristic(trimmed)) {
         await doRefine(trimmed);
       } else if (trimmed.length && quickAffirmativeConfirmation(trimmed)) {
-        await doSave();
+        try {
+          await doSave();
+        } catch (e) {
+          lastOpenAiError = String(e?.message || e);
+          ctx.pendingConfirmation = true;
+          aiMessage =
+            "Não consegui concluir o salvamento agora (instabilidade momentânea). Seu rascunho foi mantido e posso tentar novamente se você confirmar de novo com 'sim'.";
+        }
       } else if (trimmed.length) {
         try {
           const kind = await classifyPendingResumeIntentAi(trimmed);
-          if (kind === "SAVE") await doSave();
+          if (kind === "SAVE") {
+            try {
+              await doSave();
+            } catch (e) {
+              lastOpenAiError = String(e?.message || e);
+              ctx.pendingConfirmation = true;
+              aiMessage =
+                "Tentei salvar e não consegui agora. O rascunho segue guardado; responda 'sim' novamente para tentar salvar.";
+            }
+          }
           else if (kind === "CORRECT") await doRefine(trimmed);
           else {
             aiMessage =
@@ -1179,23 +1213,28 @@ app.post("/webhook/chat", async (req, res) => {
         aiMessage =
           "Envie uma confirmação (sim, ok, pode salvar…) ou diga o que deseja corrigir nos dados.";
       }
-    } else if (
-      quickAffirmativeConfirmation(text) &&
-      ctx.lastDraftResume &&
-      (!ctx.lastDraftAt || Date.now() - new Date(ctx.lastDraftAt).getTime() <= 24 * 60 * 60 * 1000)
-    ) {
-      const saved = await saveResumeFromContext(
-        String(payload.phone || payload.sessionId || ""),
-        payload,
-        ctx.lastDraftResume
-      );
-      ctx.pendingConfirmation = false;
-      ctx.pendingResume = null;
-      ctx.lastSavedResume = saved || null;
-      ctx.lastSavedResumeAt = new Date().toISOString();
-      ctx.lastIntent = "candidate";
-      aiMessage =
-        "Confirmação recebida. Usei o último rascunho da conversa e registrei a candidatura com sucesso.";
+    } else if (quickAffirmativeConfirmation(text) && hasRecoverableDraft) {
+      try {
+        const saved = await ensureResumeSavedOrThrow(
+          String(payload.phone || payload.sessionId || ""),
+          payload,
+          ctx.lastDraftResume
+        );
+        ctx.pendingConfirmation = false;
+        ctx.pendingResume = null;
+        ctx.lastSavedResume = saved || null;
+        ctx.lastSavedResumeAt = new Date().toISOString();
+        ctx.lastDraftResume = null;
+        ctx.lastDraftAt = null;
+        ctx.lastIntent = "candidate";
+        aiMessage =
+          "Confirmação recebida. Recuperei o rascunho interrompido e registrei a candidatura com sucesso.";
+      } catch (e) {
+        lastOpenAiError = String(e?.message || e);
+        ctx.pendingConfirmation = true;
+        aiMessage =
+          "Recuperei o rascunho interrompido, mas ainda não consegui salvar no banco. Pode confirmar novamente com 'sim' que eu tento de novo.";
+      }
     } else if (intent === "company") {
       ctx.lastIntent = "company";
       aiMessage =
