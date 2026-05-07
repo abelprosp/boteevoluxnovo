@@ -235,6 +235,8 @@ function defaultConversationState() {
     pendingResume: null,
     awaitingResume: false,
     recentTurns: [],
+    lastSavedResume: null,
+    lastSavedResumeAt: null,
   };
 }
 
@@ -257,6 +259,11 @@ function mergeConversationState(raw) {
         : null,
     awaitingResume: Boolean(r.awaitingResume),
     recentTurns: Array.isArray(r.recentTurns) ? r.recentTurns : [],
+    lastSavedResume:
+      r.lastSavedResume != null && typeof r.lastSavedResume === "object"
+        ? r.lastSavedResume
+        : null,
+    lastSavedResumeAt: r.lastSavedResumeAt ?? null,
   };
 }
 
@@ -772,6 +779,19 @@ async function loadConversationContextForRequest(payload, rawBody) {
   return ctx;
 }
 
+async function saveConversationContextForRequest(payload, rawBody, state) {
+  const keys = [
+    payload.sessionId,
+    ...alternateConversationLookupIds(rawBody, payload.sessionId),
+  ].filter(Boolean);
+  let firstError = null;
+  for (const k of keys) {
+    const r = await saveContext(k, state);
+    if (!firstError && r?.error) firstError = r.error;
+  }
+  return { error: firstError };
+}
+
 async function classifyIntent(payload, ctx) {
   const history = [
     ...ctx.recentTurns.slice(-4),
@@ -978,13 +998,59 @@ async function saveResumeFromContext(phone, payload, extracted) {
       null,
     fileSessionKey: ingest.sessionId || payload.sessionId,
   });
-  const { data, error } = await supabase
+  // Mantém histórico e também tenta atualizar o último currículo do mesmo telefone.
+  // Se não encontrar registro anterior, faz INSERT normalmente.
+  try {
+    const byUpdated = await supabase
+      .from("resumes")
+      .select("id")
+      .eq("candidate_phone", resume.candidate_phone)
+      .order("updated_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    let existingId = !byUpdated.error && byUpdated.data?.id ? byUpdated.data.id : null;
+
+    if (!existingId) {
+      const byCreated = await supabase
+        .from("resumes")
+        .select("id")
+        .eq("candidate_phone", resume.candidate_phone)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      existingId = !byCreated.error && byCreated.data?.id ? byCreated.data.id : null;
+    }
+
+    if (existingId) {
+      const { data, error } = await supabase
+        .from("resumes")
+        .update(resume)
+        .eq("id", existingId)
+        .select("*")
+        .single();
+      if (!error && data) return data;
+      if (error) {
+        // Fallback para insert caso schema/coluna de update seja diferente.
+        const { data: inserted, error: insertError } = await supabase
+          .from("resumes")
+          .insert(resume)
+          .select("*")
+          .single();
+        if (insertError) throw new Error(insertError.message);
+        return inserted;
+      }
+    }
+  } catch (_e) {
+    // segue para insert abaixo
+  }
+
+  const { data: inserted, error: insertError } = await supabase
     .from("resumes")
     .insert(resume)
     .select("*")
     .single();
-  if (error) throw new Error(error.message);
-  return data;
+  if (insertError) throw new Error(insertError.message);
+  return inserted;
 }
 
 app.get("/health", (_req, res) => {
@@ -1043,10 +1109,12 @@ app.post("/webhook/chat", async (req, res) => {
       const trimmed = text.trim();
 
       const doSave = async () => {
-        await saveResumeFromContext(whatsappDig, payload, ctx.pendingResume);
+        const saved = await saveResumeFromContext(whatsappDig, payload, ctx.pendingResume);
         ctx.pendingConfirmation = false;
         ctx.pendingResume = null;
         ctx.lastIntent = "candidate";
+        ctx.lastSavedResume = saved || null;
+        ctx.lastSavedResumeAt = new Date().toISOString();
         aiMessage = "Perfeito! Candidatura registrada com sucesso. Obrigado.";
       };
 
@@ -1183,7 +1251,7 @@ app.post("/webhook/chat", async (req, res) => {
       { role: "user", content: text || "[anexo]" },
       { role: "assistant", content: aiMessage },
     ];
-    const cacheSave = await saveContext(payload.sessionId, ctx);
+    const cacheSave = await saveConversationContextForRequest(payload, rawBody, ctx);
     conversationCacheError = cacheSave?.error || null;
 
     return res.json({
