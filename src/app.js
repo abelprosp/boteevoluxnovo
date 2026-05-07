@@ -533,10 +533,10 @@ async function plainTextFromResumeMedia(payload) {
 }
 
 async function extractResumeData(payload) {
-  if (!payload.mediaBase64) return null;
+  if (!payload.mediaBase64) return { data: null, error: "sem_base64" };
 
-  const { text } = await plainTextFromResumeMedia(payload);
-  if (!text) return null;
+  const { text, error: mediaError } = await plainTextFromResumeMedia(payload);
+  if (!text) return { data: null, error: mediaError || "sem_texto" };
 
   const body =
     text.length > MAX_RESUME_TEXT_FOR_LLM
@@ -569,11 +569,11 @@ async function extractResumeData(payload) {
     .replace(/\s*```\s*$/i, "")
     .trim();
   const match = stripped.match(/\{[\s\S]*\}/);
-  if (!match) return null;
+  if (!match) return { data: null, error: "json_ausente" };
   try {
-    return JSON.parse(match[0]);
+    return { data: JSON.parse(match[0]), error: null };
   } catch (_e) {
-    return null;
+    return { data: null, error: "json_invalido" };
   }
 }
 
@@ -644,6 +644,7 @@ app.post("/webhook/chat", async (req, res) => {
 
     let aiMessage = "";
     let lastOpenAiError = null;
+    let lastResumeExtractionError = null;
 
     // 2) Se já está pendente de confirmação e usuário confirmou, salva
     if (ctx.pendingConfirmation && isYes(text) && ctx.pendingResume) {
@@ -669,7 +670,10 @@ app.post("/webhook/chat", async (req, res) => {
             "Recebi o arquivo, mas sem o conteúdo para leitura. Reenvie o currículo como PDF/imagem/DOCX com o arquivo anexado corretamente para eu extrair os dados.";
         } else {
           try {
-            const extracted = await extractResumeData(payload);
+            const { data: extracted, error: extractionError } = await extractResumeData(
+              payload
+            );
+            lastResumeExtractionError = extractionError || null;
             if (!extracted) {
               aiMessage =
                 "Não consegui extrair os dados do currículo. Pode reenviar o arquivo, por favor?";
@@ -725,6 +729,9 @@ app.post("/webhook/chat", async (req, res) => {
       message: aiMessage,
       ...(lastOpenAiError
         ? { openai_error: lastOpenAiError.slice(0, 500) }
+        : {}),
+      ...(lastResumeExtractionError
+        ? { resume_extraction_error: lastResumeExtractionError }
         : {}),
       mychatPayload: {
         number: payload.phone || payload.sessionId,
