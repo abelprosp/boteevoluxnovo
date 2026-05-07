@@ -45,6 +45,10 @@ function normalizeResumePayload(body) {
   ).replace(/\D/g, "") || "sem-sessao"}/${encodeURIComponent(fallbackFileName)}`;
   const file_name = body.fileName ?? body.file_name ?? fallbackFileName;
   const file_path = body.filePath ?? body.file_path ?? fallbackFilePath;
+  const file_url =
+    body.fileUrl ??
+    body.file_url ??
+    `https://boteevoluxnovo.vercel.app/files/${encodeURIComponent(file_path)}`;
 
   const parsedFileSize =
     body.fileSize != null
@@ -66,7 +70,7 @@ function normalizeResumePayload(body) {
     file_path,
     file_size: safeFileSize,
     file_type: body.mimetype ?? body.file_type ?? null,
-    file_url: body.fileUrl ?? body.file_url ?? null,
+    file_url,
   };
 
   if (!payload.candidate_phone) {
