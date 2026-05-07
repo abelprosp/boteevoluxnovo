@@ -149,6 +149,56 @@ async function tryUploadResumeFromBody(body, sessionKey) {
 /**
  * Campos de arquivo: com upload; ou URL/path explícitos no body; ou null (sem link quebrado).
  */
+/**
+ * Schema legado da tabela `resumes`: muitos projetos têm NOT NULL em file_* e às vezes em email.
+ * Evita HTTP 500 no insert quando o n8n manda sem arquivo/base64 ou email vazio.
+ */
+function coerceRowForSupabaseInsert(row) {
+  const out = { ...row };
+  const phone = out.candidate_phone || "sem-telefone";
+
+  out.candidate_name =
+    out.candidate_name != null && String(out.candidate_name).trim() !== ""
+      ? String(out.candidate_name).trim()
+      : "";
+  out.candidate_email =
+    out.candidate_email != null && String(out.candidate_email).trim() !== ""
+      ? String(out.candidate_email).trim()
+      : "";
+
+  const storageMissing =
+    out.file_url == null ||
+    String(out.file_url).trim() === "" ||
+    out.file_path == null ||
+    String(out.file_path).trim() === "";
+
+  if (storageMissing) {
+    out.file_path =
+      out.file_path && String(out.file_path).trim() !== ""
+        ? out.file_path
+        : `no-file/${phone}/${Date.now()}`;
+    out.file_url = String(out.file_url || "").trim();
+    if (out.file_size == null || Number.isNaN(Number(out.file_size))) {
+      out.file_size = 0;
+    }
+    if (!String(out.file_type || "").trim()) {
+      out.file_type = "application/octet-stream";
+    }
+    if (!String(out.file_name || "").trim()) {
+      out.file_name = "curriculo";
+    }
+  } else {
+    if (out.file_size == null || Number.isNaN(Number(out.file_size))) {
+      out.file_size = 0;
+    }
+    if (!String(out.file_type || "").trim()) {
+      out.file_type = "application/octet-stream";
+    }
+  }
+
+  return out;
+}
+
 function mergeFileFields(body, uploaded) {
   if (uploaded) {
     return {
@@ -231,7 +281,8 @@ app.get("/api/health", healthHandler);
 
 async function insertResume(req, res) {
   try {
-    const row = await buildResumeRow(req.body);
+    const rawRow = await buildResumeRow(req.body);
+    const row = coerceRowForSupabaseInsert(rawRow);
     const { data, error } = await supabase
       .from("resumes")
       .insert(row)
@@ -243,6 +294,8 @@ async function insertResume(req, res) {
         ok: false,
         error: "Erro ao salvar currículo no Supabase",
         details: error.message,
+        code: error.code,
+        hint: error.hint,
       });
     }
 
