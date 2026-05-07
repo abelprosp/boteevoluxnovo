@@ -1,5 +1,5 @@
 /**
- * API mínima: persiste candidato currículo no Supabase (+ upload opcional no Storage).
+ * API mínima: persiste currículos no Supabase + upload no Storage (comportamento alinhado ao evoluxbote).
  */
 const crypto = require("crypto");
 require("dotenv").config();
@@ -12,6 +12,19 @@ app.use(express.json({ limit: "15mb" }));
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "resumes";
+/** Se "1", usa URL assinada (útil quando o bucket não é público). */
+const STORAGE_SIGNED_URL =
+  String(process.env.SUPABASE_STORAGE_SIGNED_URL || "")
+    .toLowerCase() === "1" ||
+  String(process.env.STORAGE_SIGN_URL || "")
+    .toLowerCase() === "1";
+const SIGNED_URL_TTL_SEC = Math.min(
+  Math.max(
+    Number(process.env.SUPABASE_STORAGE_SIGNED_TTL_SEC || 31536000),
+    60
+  ),
+  60 * 60 * 24 * 365 * 10
+);
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error(
@@ -23,12 +36,9 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
 
-const BASE_PUBLIC_URL =
-  process.env.PUBLIC_APP_URL?.replace(/\/$/, "") ||
-  "";
-
 function extractBase64(body) {
   const raw =
+    body.resumeBase64 ??
     body.file_base64 ??
     body.fileBase64 ??
     body.mediaBase64 ??
@@ -38,25 +48,50 @@ function extractBase64(body) {
   const s = String(raw).trim();
   const m = /^data:([^;]+);base64,(.+)$/is.exec(s);
   if (m) {
-    return { base64: m[2].replace(/\s/g, ""), hintedType: m[1].trim() };
+    return {
+      base64: m[2].replace(/\s/g, ""),
+      hintedType: m[1].trim(),
+    };
   }
   return { base64: s.replace(/\s/g, ""), hintedType: null };
 }
 
-function sanitizeFileName(name) {
-  const base = String(name || "curriculo")
-    .replace(/[\\/]/g, "_")
-    .replace(/[^\w.\-+ ]/gu, "_")
-    .slice(0, 180);
-  return base.trim() || "curriculo";
+function safeFileName(name) {
+  const base = String(name || "curriculo").replace(/[^\w.\-]+/g, "_");
+  return base || "curriculo";
 }
 
-async function uploadResumeFile({
-  sessionKey,
-  fallbackFileName,
-  file_type,
-  body,
-}) {
+function isPdfBuffer(buffer) {
+  return (
+    buffer.length >= 5 &&
+    buffer[0] === 0x25 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x44 &&
+    buffer[3] === 0x46
+  );
+}
+
+async function storageObjectUrl(objectPath) {
+  if (STORAGE_SIGNED_URL) {
+    const { data, error } = await supabase.storage
+      .from(STORAGE_BUCKET)
+      .createSignedUrl(objectPath, SIGNED_URL_TTL_SEC);
+    if (error) {
+      throw new Error(`URL assinada do Storage: ${error.message}`);
+    }
+    return data.signedUrl;
+  }
+  const { data } = supabase.storage
+    .from(STORAGE_BUCKET)
+    .getPublicUrl(objectPath);
+  return data.publicUrl;
+}
+
+/**
+ * Upload no bucket (mesma ideia do evoluxbote: chave `sessionKey/timestamp-nome`).
+ * Retorna null se não houver base64 não vazio.
+ */
+async function tryUploadResumeFromBody(body, sessionKey) {
   const parsed = extractBase64(body);
   if (!parsed) return null;
 
@@ -66,21 +101,33 @@ async function uploadResumeFile({
   } catch {
     throw new Error("Arquivo em base64 inválido");
   }
-  if (!buffer.length) throw new Error("Arquivo vazio após decodificar base64");
+  if (!buffer.length) return null;
 
-  const fname = sanitizeFileName(body.fileName ?? body.file_name ?? fallbackFileName);
-  const id = crypto.randomBytes(8).toString("hex");
-  const objectPath = `evolux/${sessionKey}/${Date.now()}_${id}_${fname}`;
-
-  const contentType =
-    String(file_type || "").trim() ||
-    parsed.hintedType ||
+  let safeName = safeFileName(body.fileName ?? body.file_name ?? "curriculo");
+  let uploadContentType =
+    String(body.mimetype ?? body.file_type ?? "").trim() ||
+    (parsed.hintedType && parsed.hintedType.includes("/")
+      ? parsed.hintedType
+      : "") ||
     "application/octet-stream";
+
+  if (isPdfBuffer(buffer)) {
+    uploadContentType = "application/pdf";
+    if (!safeName.toLowerCase().endsWith(".pdf")) {
+      safeName = safeName.replace(/\.[^.]+$/, "") + ".pdf";
+    }
+  }
+
+  const folder = String(sessionKey || "unknown").replace(
+    /[^a-zA-Z0-9_-]/g,
+    "_"
+  );
+  const objectPath = `${folder}/${Date.now()}-${crypto.randomBytes(4).toString("hex")}-${safeName}`;
 
   const { error: uploadError } = await supabase.storage
     .from(STORAGE_BUCKET)
     .upload(objectPath, buffer, {
-      contentType,
+      contentType: uploadContentType,
       upsert: false,
     });
 
@@ -88,63 +135,58 @@ async function uploadResumeFile({
     throw new Error(`Upload no bucket "${STORAGE_BUCKET}": ${uploadError.message}`);
   }
 
-  const { data: pub } = supabase.storage
-    .from(STORAGE_BUCKET)
-    .getPublicUrl(objectPath);
+  const file_url = await storageObjectUrl(objectPath);
 
   return {
     file_path: objectPath,
-    file_url: pub.publicUrl,
+    file_url,
     file_size: buffer.length,
+    file_type: uploadContentType,
+    file_name: body.fileName ?? body.file_name ?? safeName,
   };
 }
 
-function fallbackSyntheticFileFields({
-  body,
-  sessionKey,
-  fallbackFileName,
-  uploaded,
-}) {
-  const fallbackFilePath = `webhook/evolux/${sessionKey}/${encodeURIComponent(
-    fallbackFileName
-  )}`;
-
-  const file_path =
-    uploaded?.file_path ??
-    body.filePath ??
-    body.file_path ??
-    fallbackFilePath;
-
-  let file_url =
-    uploaded?.file_url ?? body.fileUrl ?? body.file_url ?? null;
-
-  if (!file_url) {
-    if (BASE_PUBLIC_URL) {
-      file_url = `${BASE_PUBLIC_URL}/files/${encodeURIComponent(file_path)}`;
-    } else {
-      file_url = `https://app.local/files/${encodeURIComponent(file_path)}`;
-    }
+/**
+ * Campos de arquivo: com upload; ou URL/path explícitos no body; ou null (sem link quebrado).
+ */
+function mergeFileFields(body, uploaded) {
+  if (uploaded) {
+    return {
+      file_name: uploaded.file_name,
+      file_path: uploaded.file_path,
+      file_size: uploaded.file_size,
+      file_type: uploaded.file_type,
+      file_url: uploaded.file_url,
+    };
   }
 
-  const parsedFileSize =
-    body.fileSize != null
-      ? Number(body.fileSize)
-      : body.file_size != null
-      ? Number(body.file_size)
-      : uploaded?.file_size ?? NaN;
-  const safeFileSize =
-    uploaded?.file_size != null
-      ? uploaded.file_size
-      : Number.isFinite(parsedFileSize) && parsedFileSize >= 0
-      ? parsedFileSize
-      : 0;
+  const explicitUrl = body.fileUrl ?? body.file_url ?? null;
+  if (explicitUrl) {
+    const fsz =
+      body.fileSize != null
+        ? Number(body.fileSize)
+        : body.file_size != null
+        ? Number(body.file_size)
+        : NaN;
+    return {
+      file_name: body.fileName ?? body.file_name ?? null,
+      file_path: body.filePath ?? body.file_path ?? null,
+      file_size: Number.isFinite(fsz) ? fsz : null,
+      file_type:
+        String(body.mimetype ?? body.file_type ?? "").trim() || null,
+      file_url: explicitUrl,
+    };
+  }
 
-  return { file_path, file_url, file_size: safeFileSize };
+  return {
+    file_name: body.fileName ?? body.file_name ?? null,
+    file_path: null,
+    file_url: null,
+    file_size: null,
+    file_type: body.mimetype ?? body.file_type ?? null,
+  };
 }
 
-/**
- * Aceita tanto camelCase quanto snake_case (útil quando o payload vem já pronto do n8n).
- */
 async function buildResumeRow(body) {
   if (!body || typeof body !== "object") {
     throw new Error("Payload inválido");
@@ -157,30 +199,12 @@ async function buildResumeRow(body) {
     throw new Error("Campo obrigatório ausente: phone ou candidate_phone");
   }
 
-  const fallbackFileName =
-    String(body.fileName ?? body.file_name ?? "").trim() || "curriculo";
-
   const sessionKey = String(
     body.sessionId ?? body.phone ?? phoneDigits ?? "sessao"
-  ).replace(/\D/g, "") || "sem-sessao";
+  ).replace(/\D/g, "") || "sem_sessao";
 
-  const file_type =
-    String(body.mimetype ?? body.file_type ?? "").trim() ||
-    "application/octet-stream";
-
-  const uploaded = await uploadResumeFile({
-    sessionKey,
-    fallbackFileName,
-    file_type,
-    body,
-  });
-
-  const { file_path, file_url, file_size } = fallbackSyntheticFileFields({
-    body,
-    sessionKey,
-    fallbackFileName,
-    uploaded,
-  });
+  const uploaded = await tryUploadResumeFromBody(body, sessionKey);
+  const ff = mergeFileFields(body, uploaded);
 
   return {
     candidate_name: body.fullName ?? body.candidate_name ?? null,
@@ -189,28 +213,22 @@ async function buildResumeRow(body) {
     city: body.city ?? null,
     position_of_interest:
       body.jobInterest ?? body.position_of_interest ?? null,
-    file_name: body.fileName ?? body.file_name ?? fallbackFileName,
-    file_path,
-    file_size,
-    file_type,
-    file_url,
+    ...ff,
   };
 }
 
 const healthHandler = (_req, res) => {
-  res.json({ ok: true, service: "evolux-resumes-api", storageBucket: STORAGE_BUCKET });
+  res.json({
+    ok: true,
+    service: "evolux-resumes-api",
+    storageBucket: STORAGE_BUCKET,
+    storageSignedUrl: STORAGE_SIGNED_URL,
+  });
 };
 
 app.get("/health", healthHandler);
 app.get("/api/health", healthHandler);
 
-/**
- * POST /webhook/resume | /resume
- * Body: fullName, email, phone, city, jobInterest,
- * opcional: file_base64 ou mediaBase64 (conteúdo do arquivo),
- * fileName, mimetype,
- * opcionalmente filePath, file_url, file_size
- */
 async function insertResume(req, res) {
   try {
     const row = await buildResumeRow(req.body);
