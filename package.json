@@ -1,7 +1,7 @@
 {
   "name": "api",
   "version": "1.0.0",
-  "description": "API webhook + jobs com Supabase",
+  "description": "API para salvar currículos (candidatos) no Supabase",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
@@ -15,8 +15,6 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.105.3",
     "dotenv": "^17.4.2",
-    "express": "^5.2.1",
-    "mammoth": "^1.12.0",
-    "unpdf": "^1.6.2"
+    "express": "^5.2.1"
   }
 }

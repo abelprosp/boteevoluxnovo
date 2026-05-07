@@ -1,0 +1,343 @@
+{
+    "name": "My workflow 8",
+    "nodes": [
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "https://api.prime.mychatbot.com.br/v2/api/external/b92b0d0b-cd7d-41ad-b7ac-6a339bd8895e",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Authorization",
+                "value": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0ZW5hbnRJZCI6MTIsInByb2ZpbGUiOiJhZG1pbiIsInNlc3Npb25JZCI6MTgsImlhdCI6MTc3NzU1NzE4MCwiZXhwIjoxODQwNjI5MTgwfQ.MT0yTzTR2sjVzd0FJzDdHMsXeZuifJUgOaFCwEmdxJU"
+              },
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ number: $json.number, body: $json.body, externalKey: $json.externalKey, isClosed: $json.isClosed }) }}",
+          "options": {}
+        },
+        "id": "a195c9e1-3c38-4042-93c5-f8b06e5641db",
+        "name": "Enviar MyChat1",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4,
+        "position": [
+          1328,
+          400
+        ]
+      },
+      {
+        "parameters": {
+          "functionCode": "const item = $input.first().json || {};\nconst norm = $('Normalizar Entrada1').first();\nconst filt = $('Filtrar Inválidas').first();\nconst upstream = (filt && filt.json) || (norm && norm.json) || {};\n\nfunction pickAssistantText(agentJson) {\n  const o = agentJson && agentJson.output;\n  if (o == null) return '';\n  if (typeof o === 'string') return o;\n  if (typeof o === 'object') {\n    if (typeof o.text === 'string') return o.text;\n    if (typeof o.message === 'string') return o.message;\n  }\n  return '';\n}\n\nconst p = item.mychatPayload || {};\nconst number = String(\n  p.number || item.phone || upstream.phone || upstream.sessionId || ''\n).replace(/\\D/g, '');\n\nlet msg =\n  pickAssistantText(item) ||\n  String(item.body || item.message || item.response || '').trim();\nif (!msg) msg = String(p.body || '').trim();\nmsg = msg.replace(/[\\r\\n]+/g, ' ').trim();\n\nif (!number || !msg) {\n  throw new Error(\n    'API nao retornou dados para MyChat (numero do webhook + texto em output do AI Agent).'\n  );\n}\n\nreturn [{\n  json: {\n    number,\n    body: msg,\n    externalKey: p.externalKey || `lead_${number}`,\n    isClosed: p.isClosed === true,\n  },\n}];"
+        },
+        "id": "398276ca-985c-4c70-9b2c-f74a02c1c548",
+        "name": "Formatar MyChat1",
+        "type": "n8n-nodes-base.function",
+        "typeVersion": 1,
+        "position": [
+          1088,
+          400
+        ]
+      },
+      {
+        "parameters": {
+          "functionCode": "const envelope = $json || {};\nconst body = envelope.body || envelope;\nconst content = body.content || body.message || body.data?.content || {};\nconst contact = body.contact || body.sender || body.data?.contact || {};\n\nconst doc =\n  content.document ||\n  content.documentMessage ||\n  body.document ||\n  body.documentMessage ||\n  content.image ||\n  body.image ||\n  null;\n\nconst rawMsg =\n  content.text ||\n  content.body ||\n  content.caption ||\n  body.message?.text ||\n  body.message ||\n  '';\n\nconst chatInput = String(rawMsg || '').trim();\n\nlet phone = String(\n  contact.number ||\n  contact.phone ||\n  contact.id?.user ||\n  body.phone ||\n  body.sessionId ||\n  ''\n).replace(/\\D/g, '');\n\nif (!phone) return [{ json: { ignore: true, ignoreReason: 'no_phone' } }];\nif (!phone.startsWith('55')) phone = '55' + phone;\n\nconst mediaBase64 =\n  content.media ||\n  content.base64 ||\n  doc?.base64 ||\n  doc?.data ||\n  body.mediaBase64 ||\n  body.document?.base64 ||\n  body.documentMessage?.base64 ||\n  null;\n\nconst mimetype = String(\n  content.mimetype ||\n  content.mimeType ||\n  content.mime_type ||\n  doc?.mimetype ||\n  doc?.mimeType ||\n  doc?.mime_type ||\n  body.mimetype ||\n  ''\n).toLowerCase();\n\nconst fileName =\n  content.fileName ||\n  content.filename ||\n  content.file_name ||\n  doc?.fileName ||\n  doc?.filename ||\n  doc?.file_name ||\n  body.fileName ||\n  body.file_name ||\n  null;\n\nconst hasAny = !!chatInput || !!mediaBase64 || !!mimetype || !!fileName;\nif (!hasAny) {\n  return [{\n    json: {\n      ignore: true,\n      ignoreReason: 'empty_payload',\n      phone,\n      sessionId: phone,\n      chatInput: '',\n    },\n  }];\n}\n\nreturn [{\n  json: {\n    ignore: false,\n    phone,\n    sessionId: phone,\n    chatInput,\n    mediaBase64,\n    mimetype,\n    fileName,\n    rawPayload: body,\n    history: []\n  }\n}];"
+        },
+        "id": "d8a54098-f8fe-4a1b-b5c4-4a40e24fbb84",
+        "name": "Normalizar Entrada1",
+        "type": "n8n-nodes-base.function",
+        "typeVersion": 1,
+        "position": [
+          384,
+          400
+        ]
+      },
+      {
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "webhook-evolux",
+          "options": {}
+        },
+        "id": "3a697205-c3d0-4b5d-ab05-9aced890d3ce",
+        "name": "Webhook1",
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2,
+        "position": [
+          144,
+          400
+        ],
+        "webhookId": "evolux-webhook-chat"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "typeValidation": "strict"
+            },
+            "conditions": [
+              {
+                "id": "cond-ignore-true",
+                "leftValue": "={{ $json.ignore }}",
+                "rightValue": true,
+                "operator": {
+                  "type": "boolean",
+                  "operation": "equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "id": "b6e214a0-f1c2-4d8e-9a3b-0c44e2a89100",
+        "name": "Filtrar Inválidas",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2,
+        "position": [
+          480,
+          400
+        ]
+      },
+      {
+        "parameters": {
+          "promptType": "define",
+          "text": "={{ $json.chatInput }}",
+          "options": {
+            "systemMessage": "Você é a Luh, assistente virtual da EvoluxRH.\n\nSeu objetivo é fazer a triagem inicial de pessoas que entram em contato, identificando se são candidatos ou empresas.\n\nSe for EMPRESA:\nInforme que em breve um atendente humano entrará em contato e aguarde.\n\nSe for CANDIDATO, colete as informações uma por vez, na seguinte ordem:\n\nNome completo\nE-mail (se tiver)\nTelefone (WhatsApp)\nCidade\nÁrea de interesse\nCurrículo (solicite o envio do arquivo)\nApós coletar todos os dados, envie as informações para a ferramenta salvar_curriculo.\n\nRegras importantes:\n\nSeja cordial, objetiva e profissional\nFaça uma pergunta por vez — nunca pergunte tudo de uma vez\nNão invente informações\nSó chame a ferramenta salvar_curriculo após ter coletado todos os dados acima\n\n\nMensagem de boas-vindas da Luh:\n\nOlá! 👋 Seja bem-vindo(a) à EvoluxRH!\n\nEu sou a Luh, assistente virtual da EvoluxRH. Estou aqui para te ajudar! 😊\n\nAntes de começar, me conta: você é um candidato em busca de oportunidades, ou representa uma empresa interessada em nossos serviços?\n\nSe for CANDIDATO, a Luh responde:\n\nQue ótimo! Vamos começar seu cadastro. 📋\nPara te ajudar da melhor forma, vou precisar de algumas informações.\n\nPrimeiro, qual é o seu nome completo?\n\nSe for EMPRESA, a Luh responde:\n\nObrigada pelo contato! 🏢\nUm de nossos atendentes entrará em contato com você em breve.\nPor favor, aguarde — logo alguém da nossa equipe estará disponível para te atender. 😊"
+          }
+        },
+        "type": "@n8n/n8n-nodes-langchain.agent",
+        "typeVersion": 2.1,
+        "position": [
+          592,
+          400
+        ],
+        "id": "4c9414ad-f505-4b1f-8af8-ea9e373b0219",
+        "name": "AI Agent"
+      },
+      {
+        "parameters": {
+          "model": {
+            "__rl": true,
+            "mode": "list",
+            "value": "gpt-4.1-mini"
+          },
+          "options": {}
+        },
+        "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+        "typeVersion": 1.2,
+        "position": [
+          464,
+          608
+        ],
+        "id": "ef7819dc-b4f3-427d-b437-1a4c65a49a4c",
+        "name": "OpenAI Chat Model",
+        "credentials": {
+          "openAiApi": {
+            "id": "S8ydcmQQhSlwSFDK",
+            "name": "OpenAi account"
+          }
+        }
+      },
+      {
+        "parameters": {
+          "sessionIdType": "customKey",
+          "sessionKey": "={{ $json.sessionId || $json.phone }}",
+          "contextWindowLength": 5
+        },
+        "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+        "typeVersion": 1.3,
+        "position": [
+          608,
+          608
+        ],
+        "id": "5daa1b77-0d7c-4752-8214-a6bcd91bd545",
+        "name": "Simple Memory"
+      },
+      {
+        "parameters": {
+          "toolDescription": "Persiste na base Evolux o currículo do candidato já coletado na conversa. Chame somente quando tiver: nome completo, e-mail se houver, telefone WhatsApp (com DDD/código país 55), cidade, área de interesse, e arquivo do currículo (nome/arquivo já enviado). Parâmetro phone deve estar só com dígitos (preferir o mesmo formato do webhook). Opcionalmente preencher fileName e mimetype se o candidato mandou arquivo.",
+          "method": "POST",
+          "url": "https://boteevoluxnovo.vercel.app/resume",
+          "authentication": "none",
+          "sendHeaders": true,
+          "specifyHeaders": "keypair",
+          "parametersHeaders": {
+            "values": [
+              {
+                "name": "Content-Type",
+                "valueProvider": "fieldValue",
+                "value": "application/json"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "{\n  \"fullName\": \"{fullName}\",\n  \"email\": \"{email}\",\n  \"phone\": \"{phone}\",\n  \"city\": \"{city}\",\n  \"jobInterest\": \"{jobInterest}\",\n  \"fileName\": \"{fileName}\",\n  \"mimetype\": \"{mimetype}\",\n  \"sessionId\": \"{sessionId}\"\n}",
+          "placeholderDefinitions": {
+            "values": [
+              {
+                "name": "fullName",
+                "description": "Nome completo do candidato conforme declarado.",
+                "type": "string"
+              },
+              {
+                "name": "email",
+                "description": "Endereço de e-mail válido ou string vazio se não tiver.",
+                "type": "string"
+              },
+              {
+                "name": "phone",
+                "description": "Telefone só com dígitos; incluir 55 antes do DDD quando for WhatsApp.",
+                "type": "string"
+              },
+              {
+                "name": "city",
+                "description": "Cidade do candidato.",
+                "type": "string"
+              },
+              {
+                "name": "jobInterest",
+                "description": "Área ou cargo de interesse.",
+                "type": "string"
+              },
+              {
+                "name": "fileName",
+                "description": "Nome do arquivo do currículo se existir; senão use curriculo.",
+                "type": "string"
+              },
+              {
+                "name": "mimetype",
+                "description": "MIME do arquivo (ex.: application/pdf); vazio se desconhecido.",
+                "type": "string"
+              },
+              {
+                "name": "sessionId",
+                "description": "Identificador da sessão; normalmente o mesmo telefone só com dígitos (ex.: 55...).",
+                "type": "string"
+              }
+            ]
+          },
+          "optimizeResponse": false
+        },
+        "id": "c4e8a2b1-9d0e-4f2a-8c6b-1a2b3c4d5e6f",
+        "name": "salvar_curriculo",
+        "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+        "typeVersion": 1.1,
+        "position": [
+          752,
+          608
+        ]
+      }
+    ],
+    "pinData": {},
+    "connections": {
+      "Formatar MyChat1": {
+        "main": [
+          [
+            {
+              "node": "Enviar MyChat1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Normalizar Entrada1": {
+        "main": [
+          [
+            {
+              "node": "Filtrar Inválidas",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Filtrar Inválidas": {
+        "main": [
+          [],
+          [
+            {
+              "node": "AI Agent",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Webhook1": {
+        "main": [
+          [
+            {
+              "node": "Normalizar Entrada1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "OpenAI Chat Model": {
+        "ai_languageModel": [
+          [
+            {
+              "node": "AI Agent",
+              "type": "ai_languageModel",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Simple Memory": {
+        "ai_memory": [
+          [
+            {
+              "node": "AI Agent",
+              "type": "ai_memory",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "AI Agent": {
+        "main": [
+          [
+            {
+              "node": "Formatar MyChat1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "salvar_curriculo": {
+        "ai_tool": [
+          [
+            {
+              "node": "AI Agent",
+              "type": "ai_tool",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "active": false,
+    "settings": {
+      "executionOrder": "v1"
+    },
+    "versionId": "39596cef-e773-42a4-ba91-7011fc220cb3",
+    "meta": {
+      "templateCredsSetupCompleted": true,
+      "instanceId": "d3817cb33dd02ba2d93402f346d294ab5cc76eda1eaf52b18153e7c63da2da7d"
+    },
+    "id": "fxk9UiC5RTDqhgc5",
+    "tags": []
+  }

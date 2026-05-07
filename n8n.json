@@ -1,5 +1,5 @@
 {
-  "name": "Evolux RH - Webhook -> API Conversa -> MyChat",
+  "name": "Evolux RH - Fluxo Completo Local",
   "nodes": [
     {
       "parameters": {
@@ -11,18 +11,24 @@
       "name": "Webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
-      "position": [-960, 260],
+      "position": [
+        -760,
+        240
+      ],
       "webhookId": "evolux-webhook-chat"
     },
     {
       "parameters": {
-        "functionCode": "const envelope = $json || {};\nconst body = envelope.body || envelope;\nconst content = body.content || body.message || body.data?.content || {};\nconst contact = body.contact || body.sender || body.data?.contact || {};\n\nconst doc =\n  content.document ||\n  content.documentMessage ||\n  body.document ||\n  body.documentMessage ||\n  content.image ||\n  body.image ||\n  null;\n\nconst rawMsg =\n  content.text ||\n  content.body ||\n  content.caption ||\n  body.message?.text ||\n  body.message ||\n  '';\n\nconst chatInput = String(rawMsg || '').trim();\n\nlet phone = String(\n  contact.number ||\n  contact.phone ||\n  contact.id?.user ||\n  body.phone ||\n  body.sessionId ||\n  ''\n).replace(/\\D/g, '');\n\nif (!phone) return [{ json: { ignore: true } }];\nif (!phone.startsWith('55')) phone = '55' + phone;\n\nconst mediaBase64 =\n  content.media ||\n  content.base64 ||\n  doc?.base64 ||\n  doc?.data ||\n  body.mediaBase64 ||\n  body.document?.base64 ||\n  body.documentMessage?.base64 ||\n  null;\n\nconst mimetype = String(\n  content.mimetype ||\n  content.mimeType ||\n  content.mime_type ||\n  doc?.mimetype ||\n  doc?.mimeType ||\n  doc?.mime_type ||\n  body.mimetype ||\n  ''\n).toLowerCase();\n\nconst fileName =\n  content.fileName ||\n  content.filename ||\n  content.file_name ||\n  doc?.fileName ||\n  doc?.filename ||\n  doc?.file_name ||\n  body.fileName ||\n  body.file_name ||\n  null;\n\nconst hasAny = !!chatInput || !!mediaBase64 || !!mimetype || !!fileName;\nif (!hasAny) return [{ json: { ignore: true } }];\n\nreturn [{\n  json: {\n    ignore: false,\n    phone,\n    sessionId: phone,\n    chatInput,\n    mediaBase64,\n    mimetype,\n    fileName,\n    rawPayload: body,\n    history: []\n  }\n}];"
+        "functionCode": "const envelope = $json || {};\nconst body = envelope.body || envelope;\nconst content = body.content || body.message || body.data?.content || {};\nconst contact = body.contact || body.sender || body.data?.contact || {};\n\nlet phone = String(\n  contact.number ||\n  contact.phone ||\n  contact.id?.user ||\n  body.phone ||\n  body.sessionId ||\n  ''\n).replace(/\\D/g, '');\nif (!phone) return [{ json: { ignore: true } }];\nif (!phone.startsWith('55')) phone = '55' + phone;\n\nconst chatInput = String(\n  content.text || content.body || content.caption || body.message?.text || body.message || ''\n).trim();\n\nconst doc = content.document || content.documentMessage || body.document || null;\nconst mediaBase64 =\n  content.media || content.base64 || doc?.base64 || doc?.data || body.mediaBase64 || null;\n\nconst mimetype = String(\n  content.mimetype || content.mimeType || doc?.mimetype || doc?.mime_type || body.mimetype || ''\n).toLowerCase();\n\nconst fileName =\n  content.fileName || content.filename || doc?.fileName || doc?.file_name || body.fileName || null;\n\nif (!chatInput && !mediaBase64 && !mimetype && !fileName) {\n  return [{ json: { ignore: true } }];\n}\n\nreturn [{\n  json: {\n    ignore: false,\n    phone,\n    sessionId: phone,\n    chatInput,\n    mediaBase64: mediaBase64 || null,\n    mimetype: mimetype || '',\n    fileName: fileName || null,\n    rawPayload: body\n  }\n}];"
       },
       "id": "normalize-01",
       "name": "Normalizar Entrada",
       "type": "n8n-nodes-base.function",
       "typeVersion": 1,
-      "position": [-720, 260]
+      "position": [
+        -520,
+        240
+      ]
     },
     {
       "parameters": {
@@ -49,41 +55,36 @@
       "name": "Filtrar Invalidas",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [-500, 260]
+      "position": [
+        -300,
+        240
+      ]
     },
     {
       "parameters": {
-        "method": "POST",
-        "url": "https://SEU-PROJETO.vercel.app/webhook/chat",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "Content-Type",
-              "value": "application/json"
-            }
-          ]
-        },
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ phone: $json.phone, sessionId: $json.sessionId || $json.phone, chatInput: $json.chatInput || '', mediaBase64: $json.mediaBase64 || null, mimetype: $json.mimetype || '', fileName: $json.fileName || null, rawPayload: $json.rawPayload || {}, history: $json.history || [] }) }}",
-        "options": {}
+        "functionCode": "const input = $json;\nconst staticData = getWorkflowStaticData('global');\nstaticData.sessions = staticData.sessions || {};\n\nconst phone = String(input.phone || '').replace(/\\D/g, '');\nconst key = phone || String(input.sessionId || 'default');\nconst now = Date.now();\n\nconst defaultState = () => ({\n  stage: 'idle',\n  pendingResume: null,\n  lastDraftResume: null,\n  lastDraftAt: null,\n  lastSavedResume: null,\n  lastSavedResumeAt: null,\n  updatedAt: now,\n});\n\nconst state = staticData.sessions[key] || defaultState();\nstate.updatedAt = now;\n\nconst text = String(input.chatInput || '').trim();\nconst ntext = text.toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');\nconst hasFile = !!input.mediaBase64 || !!input.fileName || (input.mimetype || '').includes('pdf');\nconst isAffirmative = /\\b(sim|ok|beleza|blz|confirmo|pode cadastrar|pode salvar|manda ver|topo|combinado|fechou)\\b/i.test(ntext);\nconst isCorrection = /\\b(mas|corrig|ajust|alter|muda|troca|errad|meu email|meu telefone|cidade|cargo)\\b/i.test(ntext) || /@\\S+\\.\\S+/.test(text);\n\nasync function callOpenAI(messages, maxTokens = 900) {\n  const apiKey = $env.OPENAI_API_KEY;\n  if (!apiKey) throw new Error('OPENAI_API_KEY ausente no ambiente do n8n');\n  const model = $env.OPENAI_MODEL || 'gpt-4o-mini';\n  const resp = await fetch('https://api.openai.com/v1/chat/completions', {\n    method: 'POST',\n    headers: {\n      Authorization: `Bearer ${apiKey}`,\n      'Content-Type': 'application/json',\n    },\n    body: JSON.stringify({ model, messages, temperature: 0.2, max_tokens: maxTokens }),\n  });\n  const data = await resp.json();\n  if (!resp.ok) throw new Error(data?.error?.message || `OpenAI HTTP ${resp.status}`);\n  return String(data?.choices?.[0]?.message?.content || '').trim();\n}\n\nfunction parseJsonFromText(raw) {\n  const s = String(raw || '').replace(/^```(?:json)?\\s*/i, '').replace(/\\s*```\\s*$/i, '');\n  const m = s.match(/\\{[\\s\\S]*\\}/);\n  if (!m) return null;\n  try { return JSON.parse(m[0]); } catch { return null; }\n}\n\nasync function saveResumeToSupabase(resume) {\n  const url = $env.SUPABASE_URL;\n  const key = $env.SUPABASE_SERVICE_ROLE_KEY;\n  if (!url || !key) throw new Error('SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY ausente no ambiente do n8n');\n\n  const payload = {\n    candidate_name: resume.fullName || null,\n    candidate_email: resume.email || null,\n    candidate_phone: phone,\n    city: resume.city || null,\n    position_of_interest: resume.jobInterest || null,\n    file_name: resume.fileName || 'curriculo',\n    file_path: resume.filePath || `webhook/evolux/${phone}/${encodeURIComponent(resume.fileName || 'curriculo')}`,\n    file_size: Number.isFinite(Number(resume.fileSize)) ? Number(resume.fileSize) : 0,\n    file_type: resume.mimetype || 'application/octet-stream',\n    file_url: resume.fileUrl || `https://boteevoluxnovo.vercel.app/files/${encodeURIComponent(resume.fileName || 'curriculo')}`,\n  };\n\n  const r = await fetch(`${url}/rest/v1/resumes`, {\n    method: 'POST',\n    headers: {\n      apikey: key,\n      Authorization: `Bearer ${key}`,\n      'Content-Type': 'application/json',\n      Prefer: 'return=representation',\n    },\n    body: JSON.stringify(payload),\n  });\n\n  const data = await r.json().catch(() => ({}));\n  if (!r.ok) throw new Error(data?.message || data?.error || `Supabase HTTP ${r.status}`);\n  return Array.isArray(data) ? data[0] : data;\n}\n\nlet message = '';\nlet debug = null;\n\ntry {\n  if (state.stage === 'await_confirm' && state.pendingResume) {\n    if (isCorrection) {\n      const updatedRaw = await callOpenAI([\n        { role: 'system', content: 'Atualize os dados do currículo com base na mensagem do usuário. Retorne APENAS JSON com fullName,email,phone,city,jobInterest.' },\n        { role: 'user', content: `Dados atuais: ${JSON.stringify(state.pendingResume)}\\nMensagem: ${text}` },\n      ], 500);\n      const upd = parseJsonFromText(updatedRaw);\n      if (upd) {\n        state.pendingResume = { ...state.pendingResume, ...upd };\n        state.lastDraftResume = state.pendingResume;\n        state.lastDraftAt = new Date().toISOString();\n        message = `Atualizei os dados:\\nNome: ${state.pendingResume.fullName || '—'}\\nEmail: ${state.pendingResume.email || '—'}\\nTelefone: ${state.pendingResume.phone || phone || '—'}\\nCidade: ${state.pendingResume.city || '—'}\\nCargo: ${state.pendingResume.jobInterest || '—'}\\n\\nSe estiver certo, confirme com SIM/OK.`;\n      } else {\n        message = 'Não consegui entender a correção. Pode enviar no formato: \"meu email é ...\"';\n      }\n    } else if (isAffirmative) {\n      const saved = await saveResumeToSupabase(state.pendingResume);\n      state.lastSavedResume = saved || state.pendingResume;\n      state.lastSavedResumeAt = new Date().toISOString();\n      state.stage = 'idle';\n      state.pendingResume = null;\n      state.lastDraftResume = null;\n      state.lastDraftAt = null;\n      message = 'Perfeito! Candidatura registrada com sucesso. Obrigado.';\n    } else {\n      message = 'Se estiver tudo certo, responda com SIM/OK. Se precisar ajustar, escreva a correção (ex.: meu email é ...).';\n    }\n  } else if (hasFile) {\n    const extractRaw = await callOpenAI([\n      { role: 'system', content: 'Extraia dados de currículo e retorne APENAS JSON: {\"fullName\":null,\"email\":null,\"phone\":null,\"city\":null,\"jobInterest\":null}. Se não conseguir, use null.' },\n      { role: 'user', content: `Mensagem: ${text || '(sem texto)'}\\nArquivo: ${input.fileName || 'curriculo'}\\nMimetype: ${input.mimetype || 'desconhecido'}\\nBase64(início): ${String(input.mediaBase64 || '').slice(0, 7000)}` },\n    ], 700);\n\n    const extracted = parseJsonFromText(extractRaw);\n    if (!extracted) {\n      message = 'Recebi o arquivo, mas não consegui extrair os dados. Pode reenviar em PDF com texto selecionável?';\n      state.stage = 'idle';\n    } else {\n      state.pendingResume = {\n        ...extracted,\n        fileName: input.fileName || 'curriculo',\n        mimetype: input.mimetype || '',\n        fileSize: 0,\n      };\n      state.lastDraftResume = state.pendingResume;\n      state.lastDraftAt = new Date().toISOString();\n      state.stage = 'await_confirm';\n\n      message = `Encontrei estes dados:\\nNome: ${state.pendingResume.fullName || '—'}\\nEmail: ${state.pendingResume.email || '—'}\\nTelefone: ${state.pendingResume.phone || phone || '—'}\\nCidade: ${state.pendingResume.city || '—'}\\nCargo: ${state.pendingResume.jobInterest || '—'}\\n\\nSe estiver certo, responda SIM/OK. Se quiser corrigir, escreva a correção.`;\n    }\n  } else if (isAffirmative && state.lastDraftResume) {\n    const saved = await saveResumeToSupabase(state.lastDraftResume);\n    state.lastSavedResume = saved || state.lastDraftResume;\n    state.lastSavedResumeAt = new Date().toISOString();\n    state.stage = 'idle';\n    state.pendingResume = null;\n    state.lastDraftResume = null;\n    state.lastDraftAt = null;\n    message = 'Confirmação recebida. Recuperei o rascunho interrompido e registrei a candidatura com sucesso.';\n  } else {\n    message = 'Perfeito! Para se candidatar, envie seu currículo em PDF, imagem ou DOCX para eu extrair os dados e confirmar com você.';\n  }\n} catch (e) {\n  debug = String(e?.message || e);\n  message = 'Houve uma falha temporária no processamento. Mantive seu estado em cache. Pode tentar novamente com a última mensagem.';\n}\n\nstaticData.sessions[key] = state;\n\nreturn [{\n  json: {\n    ok: true,\n    phone,\n    sessionId: key,\n    message,\n    ...(debug ? { error_debug: debug } : {}),\n    mychatPayload: {\n      number: phone,\n      body: message,\n      externalKey: `lead_${phone}`,\n      isClosed: false,\n    }\n  }\n}];"
       },
-      "id": "chat-api-01",
-      "name": "Chamar API Conversa",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4,
-      "position": [-260, 260]
+      "id": "engine-01",
+      "name": "Engine RH com Cache",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        240
+      ]
     },
     {
       "parameters": {
-        "functionCode": "const item = $input.first().json || {};\nconst p = item.mychatPayload || {};\nconst number = String(p.number || item.phone || '').replace(/\\D/g, '');\nconst msg = String(p.body || item.message || '').replace(/[\\r\\n]+/g, ' ').trim();\nif (!number || !msg) throw new Error('API nao retornou dados para MyChat');\n\nreturn [{ json: {\n  number,\n  body: msg,\n  externalKey: p.externalKey || `lead_${number}`,\n  isClosed: p.isClosed === true\n} }];"
+        "functionCode": "const item = $input.first().json || {};\nconst p = item.mychatPayload || {};\nconst number = String(p.number || item.phone || '').replace(/\\D/g, '');\nconst msg = String(p.body || item.message || '').replace(/[\\r\\n]+/g, ' ').trim();\nif (!number || !msg) throw new Error('Fluxo não retornou dados para MyChat');\n\nreturn [{\n  json: {\n    number,\n    body: msg,\n    externalKey: p.externalKey || `lead_${number}`,\n    isClosed: p.isClosed === true\n  }\n}];"
       },
       "id": "fmt-mychat-01",
       "name": "Formatar MyChat",
       "type": "n8n-nodes-base.function",
       "typeVersion": 1,
-      "position": [-20, 260]
+      "position": [
+        220,
+        240
+      ]
     },
     {
       "parameters": {
@@ -111,7 +112,10 @@
       "name": "Enviar MyChat",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4,
-      "position": [220, 260]
+      "position": [
+        460,
+        240
+      ]
     }
   ],
   "pinData": {},
@@ -143,14 +147,14 @@
         [],
         [
           {
-            "node": "Chamar API Conversa",
+            "node": "Engine RH com Cache",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Chamar API Conversa": {
+    "Engine RH com Cache": {
       "main": [
         [
           {
@@ -177,10 +181,10 @@
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "2f9cb50d-bc2c-4f2d-9bc9-f8654b57c7da",
+  "versionId": "local-cache-flow-v1",
   "meta": {
     "instanceId": "evolux-instance"
   },
-  "id": "EvoluxConversaUnificada",
+  "id": "EvoluxConversaLocalComCache",
   "tags": []
 }
