@@ -237,6 +237,8 @@ function defaultConversationState() {
     recentTurns: [],
     lastSavedResume: null,
     lastSavedResumeAt: null,
+    lastDraftResume: null,
+    lastDraftAt: null,
   };
 }
 
@@ -264,6 +266,11 @@ function mergeConversationState(raw) {
         ? r.lastSavedResume
         : null,
     lastSavedResumeAt: r.lastSavedResumeAt ?? null,
+    lastDraftResume:
+      r.lastDraftResume != null && typeof r.lastDraftResume === "object"
+        ? r.lastDraftResume
+        : null,
+    lastDraftAt: r.lastDraftAt ?? null,
   };
 }
 
@@ -1109,7 +1116,16 @@ app.post("/webhook/chat", async (req, res) => {
       const trimmed = text.trim();
 
       const doSave = async () => {
-        const saved = await saveResumeFromContext(whatsappDig, payload, ctx.pendingResume);
+        const sourceResume =
+          ctx.pendingResume ||
+          ctx.lastDraftResume ||
+          null;
+        if (!sourceResume) {
+          aiMessage =
+            "Perdi o rascunho desta candidatura. Reenvie o currículo para eu continuar do ponto certo.";
+          return;
+        }
+        const saved = await saveResumeFromContext(whatsappDig, payload, sourceResume);
         ctx.pendingConfirmation = false;
         ctx.pendingResume = null;
         ctx.lastIntent = "candidate";
@@ -1121,12 +1137,14 @@ app.post("/webhook/chat", async (req, res) => {
       const doRefine = async (msg) => {
         try {
           const updated = await refinePendingResumeFromMessage(
-            ctx.pendingResume,
+            ctx.pendingResume || ctx.lastDraftResume || {},
             msg,
             whatsappDig.replace(/\D/g, "")
           );
           ctx.pendingResume = updated;
           ctx.pendingConfirmation = true;
+          ctx.lastDraftResume = updated;
+          ctx.lastDraftAt = new Date().toISOString();
           aiMessage =
             `Atualizei conforme você pediu:\n${formatDraftResumeReply(
               pendingResumeDataOnly(updated)
@@ -1161,6 +1179,23 @@ app.post("/webhook/chat", async (req, res) => {
         aiMessage =
           "Envie uma confirmação (sim, ok, pode salvar…) ou diga o que deseja corrigir nos dados.";
       }
+    } else if (
+      quickAffirmativeConfirmation(text) &&
+      ctx.lastDraftResume &&
+      (!ctx.lastDraftAt || Date.now() - new Date(ctx.lastDraftAt).getTime() <= 24 * 60 * 60 * 1000)
+    ) {
+      const saved = await saveResumeFromContext(
+        String(payload.phone || payload.sessionId || ""),
+        payload,
+        ctx.lastDraftResume
+      );
+      ctx.pendingConfirmation = false;
+      ctx.pendingResume = null;
+      ctx.lastSavedResume = saved || null;
+      ctx.lastSavedResumeAt = new Date().toISOString();
+      ctx.lastIntent = "candidate";
+      aiMessage =
+        "Confirmação recebida. Usei o último rascunho da conversa e registrei a candidatura com sucesso.";
     } else if (intent === "company") {
       ctx.lastIntent = "company";
       aiMessage =
@@ -1198,6 +1233,8 @@ app.post("/webhook/chat", async (req, res) => {
               },
             };
             ctx.pendingConfirmation = true;
+            ctx.lastDraftResume = ctx.pendingResume;
+            ctx.lastDraftAt = new Date().toISOString();
 
             let analise = "";
             try {
