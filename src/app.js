@@ -576,7 +576,7 @@ async function refinePendingResumeFromMessage(
         role: "system",
         content:
           "Retorne APENAS JSON: " +
-          '{"fullName","email","phone","city","jobInterest"}. Atualize só o que o usuário citou; repita os demais valores atuais quando não alterados. Use null só se o usuário pedir para apagar o campo explicitamente.",
+          '{"fullName","email","phone","city","jobInterest"}. Atualize só o que o usuário citou; repita os demais valores atuais quando não alterados. Use null só se o usuário pedir para apagar o campo explicitamente.',
       },
     ],
     prependLuizaSystem: false,
