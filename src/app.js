@@ -5,14 +5,6 @@ const { createClient } = require("@supabase/supabase-js");
 const app = express();
 app.use(express.json({ limit: "15mb" }));
 
-let pdfParseLib = null;
-let pdfParseLoadError = null;
-try {
-  pdfParseLib = require("pdf-parse");
-} catch (e) {
-  pdfParseLoadError = e;
-}
-
 let mammothLib = null;
 let mammothLoadError = null;
 try {
@@ -462,17 +454,20 @@ async function classifyIntent(payload, ctx) {
 const MAX_RESUME_TEXT_FOR_LLM = 85000;
 
 /**
- * Texto extraído de PDF usando pdf-parse 1.x (sem @napi-rs/canvas).
- * Compatible com Vercel/serverless — evita pdf-parse v2 + pdfjs-dist v5 neste projeto.
+ * Texto extraído de PDF via `unpdf` (PDF.js empacotado para serverless — evita falhas do bundle da Vercel com `pdf-parse`).
  */
 async function extractPdfTextBuffer(buffer) {
-  if (!pdfParseLib) {
-    const detail = String(pdfParseLoadError?.message || "modulo_indisponivel");
-    throw new Error(`pdf_parse_indisponivel: ${detail}`);
-  }
   const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
-  const data = await pdfParseLib(buf);
-  return (data.text || "").replace(/\s+/g, " ").trim();
+  let unpdf;
+  try {
+    unpdf = require("unpdf");
+  } catch (e) {
+    throw new Error(`pdf_extract_indisponivel: ${String(e?.message || e)}`);
+  }
+  const { extractText, getDocumentProxy } = unpdf;
+  const pdf = await getDocumentProxy(new Uint8Array(buf));
+  const { text } = await extractText(pdf, { mergePages: true });
+  return (text || "").replace(/\s+/g, " ").trim();
 }
 
 async function plainTextFromResumeMedia(payload) {

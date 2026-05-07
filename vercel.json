@@ -3,10 +3,7 @@
   "builds": [
     {
       "src": "api/index.js",
-      "use": "@vercel/node",
-      "config": {
-        "includeFiles": ["node_modules/pdf-parse/**"]
-      }
+      "use": "@vercel/node"
     }
   ],
   "routes": [
