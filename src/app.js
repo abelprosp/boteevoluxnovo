@@ -46,6 +46,16 @@ function normalizeResumePayload(body) {
   const file_name = body.fileName ?? body.file_name ?? fallbackFileName;
   const file_path = body.filePath ?? body.file_path ?? fallbackFilePath;
 
+  const parsedFileSize =
+    body.fileSize != null
+      ? Number(body.fileSize)
+      : body.file_size != null
+      ? Number(body.file_size)
+      : NaN;
+  const safeFileSize = Number.isFinite(parsedFileSize) && parsedFileSize >= 0
+    ? parsedFileSize
+    : 0;
+
   const payload = {
     candidate_name: body.fullName ?? body.candidate_name ?? null,
     candidate_email: body.email ?? body.candidate_email ?? null,
@@ -54,12 +64,7 @@ function normalizeResumePayload(body) {
     position_of_interest: body.jobInterest ?? body.position_of_interest ?? null,
     file_name,
     file_path,
-    file_size:
-      body.fileSize != null
-        ? Number(body.fileSize)
-        : body.file_size != null
-        ? Number(body.file_size)
-        : null,
+    file_size: safeFileSize,
     file_type: body.mimetype ?? body.file_type ?? null,
     file_url: body.fileUrl ?? body.file_url ?? null,
   };
@@ -431,21 +436,203 @@ function hasResumeHint(payload, text) {
   );
 }
 
-function isYes(text) {
-  const t = String(text || "")
+function normalizeIntentText(text) {
+  return String(text || "")
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .trim()
     .toLowerCase();
-  if (!t) return false;
-  const trimmed = t.replace(/^[`"'„«»¡¿\s\-–.:;]+/, "").trim();
+}
+
+function isYes(text) {
+  return quickAffirmativeConfirmation(text);
+}
+
+/** Confirmação afirmativa (qualquer “sim” coloquial curto). */
+function quickAffirmativeConfirmation(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  if (/^[\s👍👌✅✔️💚👏]+$/u.test(raw)) return true;
+
+  const n = normalizeIntentText(raw);
+  const early = n.replace(/^[`"'„«»¡¿\s\-–.:;]+/, "").trim();
+
+  if (/^(sim|si|sss+)\b([\s,!.;:?…\-–]|$)/.test(early)) return true;
+  if (/^(ok|okay|oky)\b([\s,!.;:?…]|$)/.test(early)) return true;
+  if (/^(beleza|blz)\b([\s,!.;:?…]|$)/.test(early)) return true;
+  if (/^(valeu|thanks)\b/.test(early)) return true;
+  if (/^(perfeito|otimo|otima)\b([\s,!.;:?…]|$)/.test(early)) return true;
+  if (/^(show)\b([\s,!.;:?…]|$)/.test(early)) return true;
+  if (/^(fech(o|ado|ou)?|combinad|concordo)\b([\s,!.;:?…]|$)/.test(early))
+    return true;
+  if (/^(positivo|exato|^isso)\b([\s,!.;:?…]|$)/.test(early)) return true;
   if (
-    /^(sim|si|s|confirmo|ok|correto)([\s,.:;!?…\-–]*|$)/i.test(trimmed)
+    /^ta\s+certo|^tao\s+certo|^esta\s+(cert|bom|ok)|^tudo\s+(cert|bem|bom|ok)\b/.test(
+      early
+    )
   )
     return true;
-  if (/^pode (salvar|cadastrar)\b/i.test(trimmed)) return true;
-  if (/^ta certo\b/i.test(trimmed)) return true;
-  return /\b(sim|confirmo|ok|correto)\b/i.test(trimmed);
+  if (/^(confirmo|correto)\b([\s,.;:!?]|$)/.test(early)) return true;
+  if (/^sim\b.*\bpode\b.*\b(salvar|cadastrar|gravar|registrar)\b/.test(early))
+    return true;
+
+  if (
+    /\b(sim|confirmo)\b/.test(early) &&
+    !/\b(mas|porem|porém|errad)\b/.test(early)
+  )
+    return true;
+  if (/\bpode\b.*\b(salvar|cadastrar|gravar|registrar|incluir)\b/.test(early))
+    return true;
+  if (
+    /\b(manda\s+(ver|bala))|(\b(go ahead))|(\btopo\b)/.test(early)
+  )
+    return true;
+  if (/\btudo\s+certo\b|\bbora\b|\b(está\s+)?ok\b/.test(early))
+    return true;
+
+  return /\btudo\s+(bem|bom)\b/.test(n) && !/\bn(ao|ão)\b/.test(early);
+}
+
+/** Indica correção antes de registrar (prioridade maior que só “sim”). */
+function correctionIntentHeuristic(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  const n = normalizeIntentText(raw);
+  if (/\b(mas|porem|porém)\b/.test(n)) return true;
+  if (/\b(nao|não)\b.*\b(certa|sei|sei se|sei qual)\b/.test(n))
+    return true;
+  if (/^(nao|não)$/i.test(raw.trim())) return true;
+  if (/\best(a|á)\s+errado|\b(erro|errei)|\bincorrecto\b/.test(n))
+    return true;
+  if (/\bcorrig|\bajeit|\bajust|\balter|\bmud(ar|e)?\b|\btroc(a|ar)\b|\barrum/.test(n))
+    return true;
+  if (/\b(email|e-mail)\b/.test(n) && /(@|é\s+)[\w.+-]+@/.test(raw))
+    return true;
+  if (/@\S+\.\S+/.test(raw)) return true;
+  if (
+    /\b(telefone|fone|celular|whatsapp|ddd)\b/.test(n) &&
+    /\d{4,}/.test(raw)
+  )
+    return true;
+  if (
+    /\b(cidade|moro\b|cargo|fun(c|ç)ao\b|nome)\b/.test(n) &&
+    (/\b(eh|é|seria)\b/.test(n) || /[:=]/.test(raw))
+  )
+    return true;
+  return false;
+}
+
+async function classifyPendingResumeIntentAi(userText) {
+  const clipped = String(userText || "").slice(0, 520);
+  const out = await askAI({
+    chatInput: `Mensagem do candidato (após ver os dados cadastrais extraídos): ${JSON.stringify(
+      clipped
+    )}`,
+    history: [
+      {
+        role: "system",
+        content:
+          'Classifique em só JSON válido: {"intent":"SAVE"|"CORRECT"|"UNCLEAR"}. SAVE = autoriza cadastro ou concorda (sim, beleza, manda lá, topo, combinado…). CORRECT = ajustes, erro, valores novos. UNCLEAR = fora desses dois. Só o JSON.',
+      },
+    ],
+    prependLuizaSystem: false,
+    max_tokens: 80,
+    temperature: 0.1,
+  });
+  const stripped = String(out)
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```\s*$/i, "")
+    .trim();
+  try {
+    const match = stripped.match(/\{[\s\S]*\}/);
+    const intentRaw = match
+      ? String(JSON.parse(match[0]).intent || "").toUpperCase()
+      : "";
+    if (intentRaw.includes("SAVE")) return "SAVE";
+    if (intentRaw.includes("CORRECT")) return "CORRECT";
+  } catch (_e) {}
+  return "UNCLEAR";
+}
+
+function pendingResumeDataOnly(pending) {
+  if (!pending || typeof pending !== "object") return {};
+  const { fullName, email, phone, city, jobInterest } = pending;
+  return { fullName, email, phone, city, jobInterest };
+}
+
+async function refinePendingResumeFromMessage(
+  pending,
+  userMessage,
+  whatsappDigits
+) {
+  const cur = pendingResumeDataOnly(pending);
+  const out = await askAI({
+    chatInput:
+      `Dados_atuais_json: ${JSON.stringify(cur)}\n` +
+      `Telefone_whatsapp_da_sessao: ${whatsappDigits}\n\n` +
+      `Mensagem_pedindo_ajuste: ${JSON.stringify(String(userMessage || "").slice(0, 800))}`,
+    history: [
+      {
+        role: "system",
+        content:
+          "Retorne APENAS JSON: " +
+          '{"fullName","email","phone","city","jobInterest"}. Atualize só o que o usuário citou; repita os demais valores atuais quando não alterados. Use null só se o usuário pedir para apagar o campo explicitamente.",
+      },
+    ],
+    prependLuizaSystem: false,
+    max_tokens: 520,
+    temperature: 0.2,
+  });
+  const stripped = String(out)
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```\s*$/i, "")
+    .trim();
+  const match = stripped.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error("IA não devolveu JSON de correção");
+  const parsed = JSON.parse(match[0]);
+  const keys = ["fullName", "email", "phone", "city", "jobInterest"];
+  const merged = { ...(typeof pending === "object" ? pending : {}) };
+  for (const k of keys) {
+    if (!(k in parsed) || parsed[k] === undefined) continue;
+    merged[k] = parsed[k];
+  }
+  merged._ingest = pending._ingest;
+  return merged;
+}
+
+function formatDraftResumeReply(extractedPlain) {
+  const e =
+    extractedPlain && typeof extractedPlain === "object" ? extractedPlain : {};
+  return (
+    `Nome: ${e.fullName || "—"}\n` +
+    `Email: ${e.email || "—"}\n` +
+    `Telefone: ${e.phone || "—"}\n` +
+    `Cidade: ${e.city || "—"}\n` +
+    `Cargo de interesse: ${e.jobInterest || "—"}`
+  );
+}
+
+async function reviewResumeAgainstText(resumeTextExcerpt, extractedPlain) {
+  const cap =
+    resumeTextExcerpt.length > 12000
+      ? `${resumeTextExcerpt.slice(0, 12000)}\n[... texto truncado ...]`
+      : resumeTextExcerpt;
+  const out = await askAI({
+    chatInput:
+      `Trecho do currículo (texto):\n${cap}\n\n` +
+      `Campos extraídos:\n${JSON.stringify(pendingResumeDataOnly(extractedPlain))}`,
+    history: [
+      {
+        role: "system",
+        content:
+          "Revisor RH. Em 2 a 5 frases em português, diga se os campos parecem coerentes com o texto; aponte inconsistências óbvias. Não relacione campo a campo. Seja objetivo.",
+      },
+    ],
+    prependLuizaSystem: false,
+    max_tokens: 260,
+    temperature: 0.25,
+  });
+  return String(out || "").trim();
 }
 
 /** Detecta texto de candidatura sem depender de acentos (ex.: currículo vs curriculo). */
@@ -749,7 +936,11 @@ async function extractResumeData(payload) {
   const match = stripped.match(/\{[\s\S]*\}/);
   if (!match) return { data: null, error: "json_ausente" };
   try {
-    return { data: JSON.parse(match[0]), error: null };
+    return {
+      data: JSON.parse(match[0]),
+      error: null,
+      resumeTextForReview: body,
+    };
   } catch (_e) {
     return { data: null, error: "json_invalido" };
   }
@@ -842,13 +1033,62 @@ app.post("/webhook/chat", async (req, res) => {
     let lastResumeExtractionError = null;
     let conversationCacheError = null;
 
-    // 2) Se já está pendente de confirmação e usuário confirmou, salva
-    if (ctx.pendingConfirmation && isYes(text) && ctx.pendingResume) {
-      await saveResumeFromContext(payload.phone || payload.sessionId, payload, ctx.pendingResume);
-      ctx.pendingConfirmation = false;
-      ctx.pendingResume = null;
-      ctx.lastIntent = "candidate";
-      aiMessage = "Perfeito! Candidatura registrada com sucesso. Obrigado.";
+    // 2) Aguardando confirmação afirmativa ou ajustes nos dados extraídos
+    if (ctx.pendingConfirmation && ctx.pendingResume) {
+      const whatsappDig = String(payload.phone || payload.sessionId || "");
+      const trimmed = text.trim();
+
+      const doSave = async () => {
+        await saveResumeFromContext(whatsappDig, payload, ctx.pendingResume);
+        ctx.pendingConfirmation = false;
+        ctx.pendingResume = null;
+        ctx.lastIntent = "candidate";
+        aiMessage = "Perfeito! Candidatura registrada com sucesso. Obrigado.";
+      };
+
+      const doRefine = async (msg) => {
+        try {
+          const updated = await refinePendingResumeFromMessage(
+            ctx.pendingResume,
+            msg,
+            whatsappDig.replace(/\D/g, "")
+          );
+          ctx.pendingResume = updated;
+          ctx.pendingConfirmation = true;
+          aiMessage =
+            `Atualizei conforme você pediu:\n${formatDraftResumeReply(
+              pendingResumeDataOnly(updated)
+            )}\n\n` +
+            `Se estiver bom, confirme com qualquer mensagem positiva (sim, ok, pode salvar, beleza…). Se faltar mais algum ajuste, é só escrever.`;
+        } catch (err) {
+          lastOpenAiError = String(err?.message || err);
+          aiMessage =
+            "Não consegui aplicar essa alteração agora. Tente de novo (ex.: “meu email é …”) ou confirme se os dados anteriores já servem.";
+        }
+      };
+
+      if (trimmed.length && correctionIntentHeuristic(trimmed)) {
+        await doRefine(trimmed);
+      } else if (trimmed.length && quickAffirmativeConfirmation(trimmed)) {
+        await doSave();
+      } else if (trimmed.length) {
+        try {
+          const kind = await classifyPendingResumeIntentAi(trimmed);
+          if (kind === "SAVE") await doSave();
+          else if (kind === "CORRECT") await doRefine(trimmed);
+          else {
+            aiMessage =
+              "Para cadastrar, envie qualquer confirmação positiva (sim, ok, beleza, pode salvar, manda ver…). Se algo estiver errado, diga só a correção (ex.: cidade é …, email é …).";
+          }
+        } catch (e) {
+          lastOpenAiError = String(e?.message || e);
+          aiMessage =
+            "Não entendi a resposta. Confirme de forma positiva para salvar ou descreva o que corrigir.";
+        }
+      } else {
+        aiMessage =
+          "Envie uma confirmação (sim, ok, pode salvar…) ou diga o que deseja corrigir nos dados.";
+      }
     } else if (intent === "company") {
       ctx.lastIntent = "company";
       aiMessage =
@@ -867,31 +1107,44 @@ app.post("/webhook/chat", async (req, res) => {
       if (resumeHint && hasResumeBinary) {
         ctx.awaitingResume = false;
         try {
-          const { data: extracted, error: extractionError } = await extractResumeData(
-            payload
-          );
+          const {
+            data: extracted,
+            error: extractionError,
+            resumeTextForReview,
+          } = await extractResumeData(payload);
           lastResumeExtractionError = extractionError || null;
           if (!extracted) {
             aiMessage =
               "Não consegui extrair os dados do currículo. Pode reenviar o arquivo, por favor?";
-            } else {
-              ctx.pendingResume = {
-                ...extracted,
-                _ingest: {
-                  fileName: payload.fileName,
-                  mimetype: payload.mimetype,
-                  sessionId: payload.sessionId,
-                },
-              };
-              ctx.pendingConfirmation = true;
-              aiMessage =
-              `Encontrei estes dados no currículo:\n` +
-              `Nome: ${extracted.fullName || "Não encontrado"}\n` +
-              `Email: ${extracted.email || "Não encontrado"}\n` +
-              `Telefone: ${extracted.phone || payload.phone || "Não encontrado"}\n` +
-              `Cidade: ${extracted.city || "Não encontrado"}\n` +
-              `Cargo de interesse: ${extracted.jobInterest || "Não encontrado"}\n\n` +
-              `Se estiver tudo certo, responda SIM para eu salvar.`;
+          } else {
+            ctx.pendingResume = {
+              ...extracted,
+              _ingest: {
+                fileName: payload.fileName,
+                mimetype: payload.mimetype,
+                sessionId: payload.sessionId,
+              },
+            };
+            ctx.pendingConfirmation = true;
+
+            let analise = "";
+            try {
+              if (resumeTextForReview && resumeTextForReview.length > 80) {
+                analise = await reviewResumeAgainstText(
+                  resumeTextForReview,
+                  extracted
+                );
+              }
+            } catch (_e) {}
+
+            const blocoDados = formatDraftResumeReply(
+              pendingResumeDataOnly(ctx.pendingResume)
+            );
+            aiMessage =
+              (analise ? `${analise}\n\n` : "") +
+              `📋 Dados para cadastro:\n${blocoDados}\n\n` +
+              `— Se estiver correto, responda de qualquer forma afirmativa (sim, ok, beleza, pode salvar, manda ver…).\n` +
+              `— Se algo estiver errado, escreva só a correção (ex.: meu email é nome@empresa.com).`;
           }
         } catch (e) {
           lastOpenAiError = String(e?.message || e);
