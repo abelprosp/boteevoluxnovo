@@ -5,6 +5,22 @@ const { createClient } = require("@supabase/supabase-js");
 const app = express();
 app.use(express.json({ limit: "15mb" }));
 
+let pdfParseLib = null;
+let pdfParseLoadError = null;
+try {
+  pdfParseLib = require("pdf-parse");
+} catch (e) {
+  pdfParseLoadError = e;
+}
+
+let mammothLib = null;
+let mammothLoadError = null;
+try {
+  mammothLib = require("mammoth");
+} catch (e) {
+  mammothLoadError = e;
+}
+
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -450,9 +466,12 @@ const MAX_RESUME_TEXT_FOR_LLM = 85000;
  * Compatible com Vercel/serverless — evita pdf-parse v2 + pdfjs-dist v5 neste projeto.
  */
 async function extractPdfTextBuffer(buffer) {
-  const pdfParse = require("pdf-parse");
+  if (!pdfParseLib) {
+    const detail = String(pdfParseLoadError?.message || "modulo_indisponivel");
+    throw new Error(`pdf_parse_indisponivel: ${detail}`);
+  }
   const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
-  const data = await pdfParse(buf);
+  const data = await pdfParseLib(buf);
   return (data.text || "").replace(/\s+/g, " ").trim();
 }
 
@@ -476,8 +495,11 @@ async function plainTextFromResumeMedia(payload) {
   const minLen = 8;
 
   const tryDocx = async () => {
-    const mammoth = require("mammoth");
-    const r = await mammoth.extractRawText({ buffer });
+    if (!mammothLib) {
+      const detail = String(mammothLoadError?.message || "modulo_indisponivel");
+      throw new Error(`mammoth_indisponivel: ${detail}`);
+    }
+    const r = await mammothLib.extractRawText({ buffer });
     return (r.value || "").replace(/\s+/g, " ").trim();
   };
 
