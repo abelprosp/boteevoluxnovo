@@ -190,9 +190,58 @@ function enrichChatPayload(payload, body) {
   }
 }
 
+/** Mesma conversa sempre na mesma chave (serverless não compartilha memória entre requisições). */
+function resolveConversationSessionId(body) {
+  const phoneDigits = String(body.phone ?? "").replace(/\D/g, "");
+  const rawSid =
+    body.sessionId != null && body.sessionId !== ""
+      ? String(body.sessionId).trim()
+      : "";
+  const sidDigits = rawSid.replace(/\D/g, "");
+  if (phoneDigits) {
+    if (!rawSid || sidDigits === phoneDigits) return phoneDigits;
+  }
+  if (sidDigits && sidDigits.length >= 10) return sidDigits;
+  if (rawSid) return rawSid;
+  if (phoneDigits) return phoneDigits;
+  return "default";
+}
+
+function defaultConversationState() {
+  return {
+    lastIntent: null,
+    pendingConfirmation: false,
+    pendingResume: null,
+    awaitingResume: false,
+    recentTurns: [],
+  };
+}
+
+function mergeConversationState(raw) {
+  let r = raw;
+  if (typeof r === "string") {
+    try {
+      r = JSON.parse(r);
+    } catch (_e) {
+      r = null;
+    }
+  }
+  if (!r || typeof r !== "object") return defaultConversationState();
+  return {
+    lastIntent: r.lastIntent ?? null,
+    pendingConfirmation: Boolean(r.pendingConfirmation),
+    pendingResume:
+      r.pendingResume != null && typeof r.pendingResume === "object"
+        ? r.pendingResume
+        : null,
+    awaitingResume: Boolean(r.awaitingResume),
+    recentTurns: Array.isArray(r.recentTurns) ? r.recentTurns : [],
+  };
+}
+
 function normalizeChatPayload(body) {
   let chatInput = String(body.chatInput ?? body.message ?? "").trim();
-  const sessionId = String(body.sessionId ?? body.phone ?? "default");
+  const sessionId = resolveConversationSessionId(body);
   const phone = String(body.phone ?? "").replace(/\D/g, "");
   const history = Array.isArray(body.history) ? body.history : [];
   let mediaBase64 = body.mediaBase64 || null;
@@ -353,8 +402,14 @@ function hasResumeHint(payload, text) {
 }
 
 function isYes(text) {
-  return /^(sim|s|confirmo|ok|correto|pode salvar|pode cadastrar|ta certo|tá certo)$/i.test(
-    String(text || "").trim()
+  const base = String(text || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .replace(/^["'“”‘’\s,.:;!?¿¡]+|["'“”‘’\s,.:;!?]+$/g, "")
+    .toLowerCase();
+  return /^(sim|s|confirmo|ok|correto|pode salvar|pode cadastrar|ta certo)$/.test(
+    base
   );
 }
 
@@ -393,31 +448,53 @@ async function loadContext(sessionId) {
       .select("state")
       .eq("session_id", sessionId)
       .maybeSingle();
-    if (!error && data?.state) return data.state;
-  } catch (_e) {}
-  return (
-    local || {
-      lastIntent: null,
-      pendingConfirmation: false,
-      pendingResume: null,
-      awaitingResume: false,
-      recentTurns: [],
+    if (error) {
+      console.error(
+        "[conversation_cache] select falhou:",
+        sessionId,
+        error.message
+      );
     }
-  );
+    if (!error && data != null && data.state != null) {
+      return mergeConversationState(data.state);
+    }
+  } catch (e) {
+    console.error(
+      "[conversation_cache] load exceção:",
+      sessionId,
+      String(e?.message || e)
+    );
+  }
+  if (local) return mergeConversationState(local);
+  return defaultConversationState();
 }
 
 async function saveContext(sessionId, state) {
-  contextMemory.set(sessionId, state);
+  const merged = mergeConversationState(state);
+  contextMemory.set(sessionId, merged);
   try {
-    await supabase.from("conversation_cache").upsert(
+    const { error } = await supabase.from("conversation_cache").upsert(
       {
         session_id: sessionId,
-        state,
+        state: merged,
         updated_at: new Date().toISOString(),
       },
       { onConflict: "session_id" }
     );
-  } catch (_e) {}
+    if (error) {
+      console.error(
+        "[conversation_cache] upsert falhou:",
+        sessionId,
+        error.message
+      );
+      return { error: error.message };
+    }
+    return { error: null };
+  } catch (e) {
+    const msg = String(e?.message || e);
+    console.error("[conversation_cache] upsert exceção:", sessionId, msg);
+    return { error: msg };
+  }
 }
 
 async function classifyIntent(payload, ctx) {
@@ -662,6 +739,7 @@ app.post("/webhook/chat", async (req, res) => {
     let aiMessage = "";
     let lastOpenAiError = null;
     let lastResumeExtractionError = null;
+    let conversationCacheError = null;
 
     // 2) Se já está pendente de confirmação e usuário confirmou, salva
     if (ctx.pendingConfirmation && isYes(text) && ctx.pendingResume) {
@@ -736,7 +814,8 @@ app.post("/webhook/chat", async (req, res) => {
       { role: "user", content: text || "[anexo]" },
       { role: "assistant", content: aiMessage },
     ];
-    await saveContext(payload.sessionId, ctx);
+    const cacheSave = await saveContext(payload.sessionId, ctx);
+    conversationCacheError = cacheSave?.error || null;
 
     return res.json({
       ok: true,
@@ -749,6 +828,9 @@ app.post("/webhook/chat", async (req, res) => {
         : {}),
       ...(lastResumeExtractionError
         ? { resume_extraction_error: lastResumeExtractionError }
+        : {}),
+      ...(conversationCacheError
+        ? { conversation_cache_error: conversationCacheError.slice(0, 300) }
         : {}),
       mychatPayload: {
         number: payload.phone || payload.sessionId,
