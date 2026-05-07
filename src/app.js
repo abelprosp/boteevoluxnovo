@@ -620,7 +620,7 @@ async function saveResumeFromContext(phone, payload, extracted) {
 }
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true });
+  res.json({ ok: true, service: "evolux-api" });
 });
 
 function unwrapIncomingBody(reqBody) {
